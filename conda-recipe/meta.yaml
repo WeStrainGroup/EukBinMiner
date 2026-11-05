@@ -1,0 +1,59 @@
+{% set name = "eukbinminer" %}
+{% set version = "0.1.1" %}
+
+package:
+  name: {{ name }}
+  version: {{ version }}
+
+source:
+  # Development recipe. Replace this local source with the tagged GitHub
+  # archive and sha256 when the repository location is confirmed.
+  path: ..
+
+build:
+  number: 0
+  noarch: generic
+  script:
+    - mkdir -p "${PREFIX}/bin" "${PREFIX}/share/eukbinminer/scripts" "${PREFIX}/share/eukbinminer/envs"
+    - cp bin/eukbinminer bin/eukmagminer "${PREFIX}/bin/"
+    - chmod 0755 "${PREFIX}/bin/eukbinminer" "${PREFIX}/bin/eukmagminer"
+    - cp scripts/*.py scripts/*.sh "${PREFIX}/share/eukbinminer/scripts/"
+    - cp envs/*.yml "${PREFIX}/share/eukbinminer/envs/"
+
+requirements:
+  run:
+    - python >=3.10,<3.11
+    - bash
+    - remag =0.4.4
+    - miniprot =0.18
+    - concoct =1.1.0
+    - biopython
+    - metabat2 =2.18_23_gc869c52
+    - vamb =5.0.4
+    - kun-peng =0.7.12
+    - seqkit
+    - eukcc =2.1.3
+    - taxonkit
+    - csvtk
+    - busco =6
+
+test:
+  commands:
+    - eukbinminer --version
+    - eukbinminer --help
+    - eukbinminer doctor --help
+    - eukbinminer validate --help
+    - eukmagminer --version
+    - test -f "${PREFIX}/share/eukbinminer/scripts/prepare_inputs.py"
+    - test -f "${PREFIX}/share/eukbinminer/scripts/depth_schema.py"
+    - test -f "${PREFIX}/share/eukbinminer/scripts/split_remag_coverage.py"
+
+about:
+  summary: >-
+    Cross-binner mining and within-sample selection of eukaryotic bins
+  license: CC-BY-NC-SA-4.0
+  license_file: LICENSE
+  home: https://github.com/WeStrainGroup/EukBinMiner
+
+# Development recipe. The combined external-tool dependency solve and
+# Bioconda submission remain pending validation.

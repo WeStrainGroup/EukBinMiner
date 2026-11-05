@@ -1,0 +1,20 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+*.egg-info/
+.coverage
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local workflow output and downloaded reference data.
+output/
+outputs/
+work/
+logs/
+databases/
+*.log
+
+# Conda build products.
+conda-bld/
+build_artifacts/

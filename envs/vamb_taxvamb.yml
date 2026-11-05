@@ -1,0 +1,8 @@
+name: eukbin-vamb
+channels:
+  - conda-forge
+  - bioconda
+dependencies:
+  - python=3.12
+  - vamb=5.0.4
+  - kun-peng=0.7.12

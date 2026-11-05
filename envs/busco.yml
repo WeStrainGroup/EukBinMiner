@@ -1,0 +1,8 @@
+name: eukbin-busco
+channels:
+  - conda-forge
+  - bioconda
+dependencies:
+  # SEPP builds used by BUSCO 6 currently require the CPython 3.10 ABI.
+  - python=3.10
+  - busco=6

@@ -1,0 +1,7 @@
+name: eukbin-remag
+channels:
+  - conda-forge
+  - bioconda
+dependencies:
+  - remag=0.4.4
+  - miniprot=0.18

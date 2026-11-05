@@ -1,0 +1,2727 @@
+#!/usr/bin/env python3
+"""EukBinMiner: cross-binner mining of eukaryotic bins."""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import getpass
+import fcntl
+import gzip
+import hashlib
+import json
+import math
+import os
+import re
+import shlex
+import shutil
+import struct
+import subprocess
+import sys
+import tempfile
+from collections import OrderedDict
+from dataclasses import dataclass
+from pathlib import Path
+from typing import IO, Iterable, Optional, Sequence
+
+
+VERSION = "0.1.1"
+TOOL_NAME = "EukBinMiner"
+CLI_NAME = "eukbinminer"
+BINNERS = ("remag", "concoct", "metabat2", "vamb", "taxvamb")
+QC_TOOLS = ("eukcc", "busco")
+DEFAULT_RANDOM_SEED = 6311
+KUNPENG_RELEASE_TAG = "v0.7.12"
+KUNPENG_RELEASE_COMMIT = "b3ace5c3b9af41eb453a89b5e038400c15917793"
+KUNPENG_HPC_BINARY_SHA256 = (
+    "648905c20bc1c4e298a6f8c54108762b642978deee2f737484a2e324eac2852e"
+)
+INSTALL_ROOT = Path(__file__).resolve().parents[1]
+_script_candidates = (
+    INSTALL_ROOT / "scripts",
+    INSTALL_ROOT / "share" / "eukbinminer" / "scripts",
+    INSTALL_ROOT / "share" / "eukmagminer" / "scripts",
+)
+SCRIPTS = next(
+    (
+        candidate
+        for candidate in _script_candidates
+        if (candidate / "run_binning_pilot.sh").is_file()
+    ),
+    _script_candidates[0],
+)
+ROOT = SCRIPTS.parent
+sys.path.insert(0, str(SCRIPTS))
+
+from depth_schema import DepthSchemaError, identify_depth_schema
+
+
+class UserError(ValueError):
+    """A concise user-facing validation or workflow error."""
+
+
+def note(message: str) -> None:
+    print(f"[{TOOL_NAME}] {message}", file=sys.stderr, flush=True)
+
+
+def environment_value(suffix: str) -> Optional[str]:
+    """Read the EukBinMiner variable, falling back to its legacy alias."""
+
+    primary = f"EUKBINMINER_{suffix}"
+    if primary in os.environ:
+        return os.environ[primary]
+    return os.environ.get(f"EUKMAGMINER_{suffix}")
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def atomic_text(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wt", encoding="utf-8", newline="\n") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def open_text(path: Path) -> IO[str]:
+    with path.open("rb") as handle:
+        is_gzip = handle.read(2) == b"\x1f\x8b"
+    if is_gzip:
+        return gzip.open(path, "rt", encoding="utf-8", newline=None)
+    return path.open("rt", encoding="utf-8", newline=None)
+
+
+def fasta_lengths(
+    path: Path,
+    *,
+    allow_empty: bool = False,
+) -> OrderedDict[str, int]:
+    if not path.is_file():
+        raise UserError(f"contig FASTA does not exist: {path}")
+    if path.stat().st_size == 0:
+        if allow_empty:
+            return OrderedDict()
+        raise UserError(f"contig FASTA is empty: {path}")
+    lengths: OrderedDict[str, int] = OrderedDict()
+    identifier: Optional[str] = None
+    length = 0
+
+    def finish() -> None:
+        nonlocal identifier, length
+        if identifier is None:
+            return
+        if length == 0:
+            raise UserError(f"{path}: empty sequence for {identifier}")
+        lengths[identifier] = length
+
+    try:
+        with open_text(path) as handle:
+            for line_number, raw_line in enumerate(handle, start=1):
+                line = raw_line.rstrip("\r\n")
+                if line.startswith(">"):
+                    finish()
+                    fields = line[1:].split()
+                    if not fields:
+                        raise UserError(
+                            f"{path}: empty FASTA header at line {line_number}"
+                        )
+                    identifier = fields[0]
+                    if identifier in lengths:
+                        raise UserError(
+                            f"{path}: duplicate contig ID {identifier!r}"
+                        )
+                    length = 0
+                elif not line:
+                    continue
+                elif identifier is None:
+                    raise UserError(
+                        f"{path}: sequence before first header at line "
+                        f"{line_number}"
+                    )
+                else:
+                    length += len("".join(line.split()))
+    except (OSError, EOFError, gzip.BadGzipFile) as error:
+        raise UserError(f"cannot read FASTA {path}: {error}") from error
+    finish()
+    if not lengths and not allow_empty:
+        raise UserError(f"{path}: no FASTA records")
+    return lengths
+
+
+@dataclass(frozen=True)
+class DepthInput:
+    path: Path
+    label: Optional[str] = None
+
+
+def parse_depth_inputs(values: Sequence[str | Path]) -> tuple[DepthInput, ...]:
+    inputs: list[DepthInput] = []
+    for raw_value in values:
+        value = str(raw_value)
+        label: Optional[str] = None
+        path_text = value
+        if "=" in value and not Path(value).expanduser().exists():
+            possible_label, possible_path = value.split("=", 1)
+            if possible_label and possible_path:
+                label = possible_label
+                path_text = possible_path
+        if label is not None and (
+            label != label.strip()
+            or any(character in label for character in "\t\r\n\x00")
+        ):
+            raise UserError(
+                f"invalid depth coverage label {label!r}; use a non-empty "
+                "TSV-safe name"
+            )
+        inputs.append(DepthInput(Path(path_text).expanduser().resolve(), label))
+    if not inputs:
+        raise UserError("at least one --depth input is required")
+    return tuple(inputs)
+
+
+def _depth_file_label(path: Path) -> str:
+    name = path.name
+    if name.endswith(".gz"):
+        name = name[:-3]
+    for suffix in (".tsv", ".txt", ".tab"):
+        if name.endswith(suffix):
+            name = name[: -len(suffix)]
+            break
+    if not name:
+        raise UserError(f"cannot infer coverage name from depth path: {path}")
+    return name
+
+
+def _nonnegative_depth_value(
+    value: str,
+    *,
+    source: Path,
+    identifier: str,
+    column: str,
+    line_number: int,
+) -> float:
+    try:
+        parsed = float(value)
+    except ValueError as error:
+        raise UserError(
+            f"{source}: invalid numeric value for {column!r}, contig "
+            f"{identifier!r}, line {line_number}: {value!r}"
+        ) from error
+    if not math.isfinite(parsed) or parsed < 0:
+        raise UserError(
+            f"{source}: coverage values must be finite and non-negative; "
+            f"column={column!r}, contig={identifier!r}, line={line_number}"
+        )
+    return parsed
+
+
+def normalized_depth_inputs(
+    inputs: Sequence[DepthInput],
+    contig_lengths: OrderedDict[str, int],
+    sample: str,
+) -> tuple[str, dict[str, object]]:
+    """Combine one or more generic/JGI inputs into one canonical JGI table."""
+
+    if not inputs:
+        raise UserError("at least one depth input is required")
+    generic_names = {
+        "depth",
+        "mean_depth",
+        "abundance",
+        "coverage",
+        "totalAvgDepth",
+    }
+    coverage_names: list[str] = []
+    coverage_source_names: list[str] = []
+    source_metadata: list[dict[str, object]] = []
+    combined_values: dict[str, list[str]] = {
+        identifier: [] for identifier in contig_lengths
+    }
+    combined_numeric: dict[str, list[float]] = {
+        identifier: [] for identifier in contig_lengths
+    }
+    combined_variances: dict[str, list[str]] = {
+        identifier: [] for identifier in contig_lengths
+    }
+    preserved_total: Optional[dict[str, str]] = None
+    extra_rows = 0
+
+    for depth_input in inputs:
+        source = depth_input.path
+        if not source.is_file() or source.stat().st_size == 0:
+            raise UserError(f"depth table does not exist or is empty: {source}")
+        try:
+            with open_text(source) as handle:
+                raw_header = handle.readline()
+                if not raw_header:
+                    raise UserError(f"depth table is empty: {source}")
+                columns = raw_header.rstrip("\r\n").split("\t")
+                try:
+                    schema = identify_depth_schema(columns, sample)
+                except DepthSchemaError as error:
+                    raise UserError(f"{source}: {error}") from error
+                if depth_input.label is not None:
+                    if schema.coverage_column_count != 1:
+                        raise UserError(
+                            f"{source}: NAME=PATH labels require exactly one "
+                            "coverage dimension"
+                        )
+                    override_name = depth_input.label
+                elif len(inputs) > 1 and schema.source_format in {
+                    "generic_single_coverage",
+                    "jgi_total_only",
+                }:
+                    source_name = schema.source_coverage_names[0]
+                    override_name = (
+                        _depth_file_label(source)
+                        if source_name in generic_names
+                        else source_name
+                    )
+                else:
+                    override_name = None
+                if override_name is not None:
+                    try:
+                        schema = identify_depth_schema(
+                            columns,
+                            sample,
+                            single_coverage_name=override_name,
+                        )
+                    except DepthSchemaError as error:
+                        raise UserError(f"{source}: {error}") from error
+                prospective_names = [*coverage_names, *schema.coverage_names]
+                prospective_jgi_columns = [
+                    "contigName",
+                    "contigLen",
+                    "totalAvgDepth",
+                ]
+                for name in prospective_names:
+                    prospective_jgi_columns.extend((name, f"{name}-var"))
+                collisions = sorted(
+                    {
+                        name
+                        for name in prospective_jgi_columns
+                        if prospective_jgi_columns.count(name) > 1
+                    }
+                )
+                if collisions:
+                    raise UserError(
+                        "coverage names must remain unique after JGI "
+                        "normalization; collision(s): "
+                        + ", ".join(collisions)
+                    )
+
+                observed: dict[
+                    str, tuple[list[str], list[float], list[str], Optional[str]]
+                ] = {}
+                seen_ids: set[str] = set()
+                source_extra_rows = 0
+                for line_number, raw_line in enumerate(handle, start=2):
+                    row = raw_line.rstrip("\r\n")
+                    if not row:
+                        continue
+                    fields = row.split("\t")
+                    if len(fields) != len(schema.columns):
+                        raise UserError(
+                            f"{source}: depth row {line_number} has "
+                            f"{len(fields)} fields; expected {len(schema.columns)}"
+                        )
+                    identifier = fields[schema.id_index]
+                    if not identifier:
+                        raise UserError(
+                            f"{source}: empty contig ID at line {line_number}"
+                        )
+                    if identifier in seen_ids:
+                        raise UserError(
+                            f"{source}: duplicate depth ID {identifier!r}"
+                        )
+                    seen_ids.add(identifier)
+                    values = [fields[index] for index in schema.coverage_indices]
+                    numeric_values = [
+                        _nonnegative_depth_value(
+                            value,
+                            source=source,
+                            identifier=identifier,
+                            column=name,
+                            line_number=line_number,
+                        )
+                        for name, value in zip(schema.coverage_names, values)
+                    ]
+                    variance_values: list[str] = []
+                    for name, variance_index in zip(
+                        schema.coverage_names,
+                        schema.variance_indices,
+                    ):
+                        if variance_index is None:
+                            variance_values.append("0")
+                            continue
+                        variance_text = fields[variance_index]
+                        _nonnegative_depth_value(
+                            variance_text,
+                            source=source,
+                            identifier=identifier,
+                            column=f"{name}-var",
+                            line_number=line_number,
+                        )
+                        variance_values.append(variance_text)
+                    total_text: Optional[str] = None
+                    if schema.total_index is not None:
+                        total_text = fields[schema.total_index]
+                        _nonnegative_depth_value(
+                            total_text,
+                            source=source,
+                            identifier=identifier,
+                            column="totalAvgDepth",
+                            line_number=line_number,
+                        )
+                    if schema.length_index is not None:
+                        try:
+                            observed_length = int(fields[schema.length_index])
+                        except ValueError as error:
+                            raise UserError(
+                                f"{source}: invalid contigLen for "
+                                f"{identifier!r} at line {line_number}"
+                            ) from error
+                    else:
+                        observed_length = None
+                    if identifier not in contig_lengths:
+                        source_extra_rows += 1
+                        continue
+                    if (
+                        observed_length is not None
+                        and observed_length != contig_lengths[identifier]
+                    ):
+                        raise UserError(
+                            f"{source}: length mismatch for {identifier!r}: "
+                            f"FASTA={contig_lengths[identifier]}, "
+                            f"depth={observed_length}"
+                        )
+                    observed[identifier] = (
+                        values,
+                        numeric_values,
+                        variance_values,
+                        total_text,
+                    )
+        except (OSError, EOFError, gzip.BadGzipFile) as error:
+            raise UserError(f"cannot read depth table {source}: {error}") from error
+
+        missing = [
+            identifier for identifier in contig_lengths if identifier not in observed
+        ]
+        if missing:
+            raise UserError(
+                f"{source}: {len(missing)} FASTA contigs lack depth; "
+                f"examples={missing[:10]}"
+            )
+        if len(inputs) == 1 and schema.total_index is not None:
+            preserved_total = {
+                identifier: observed[identifier][3] or "0"
+                for identifier in contig_lengths
+            }
+        for identifier in contig_lengths:
+            values, numeric_values, variances, _ = observed[identifier]
+            combined_values[identifier].extend(values)
+            combined_numeric[identifier].extend(numeric_values)
+            combined_variances[identifier].extend(variances)
+        coverage_names.extend(schema.coverage_names)
+        coverage_source_names.extend(schema.source_coverage_names)
+        extra_rows += source_extra_rows
+        source_metadata.append(
+            {
+                "path": str(source),
+                "label": depth_input.label,
+                "format": schema.source_format,
+                "coverage_source_columns": list(schema.source_coverage_names),
+                "coverage_columns": list(schema.coverage_names),
+                "coverage_column_count": schema.coverage_column_count,
+                "extra_depth_rows_ignored": source_extra_rows,
+            }
+        )
+
+    header_fields = ["contigName", "contigLen", "totalAvgDepth"]
+    for name in coverage_names:
+        header_fields.extend((name, f"{name}-var"))
+    lines = ["\t".join(header_fields) + "\n"]
+    for identifier, length in contig_lengths.items():
+        if preserved_total is not None:
+            total_text = preserved_total[identifier]
+        elif len(combined_values[identifier]) == 1:
+            total_text = combined_values[identifier][0]
+        else:
+            total_text = format(math.fsum(combined_numeric[identifier]), ".17g")
+        fields = [identifier, str(length), total_text]
+        for value, variance in zip(
+            combined_values[identifier],
+            combined_variances[identifier],
+        ):
+            fields.extend((value, variance))
+        lines.append("\t".join(fields) + "\n")
+
+    total_policy = (
+        "provided"
+        if preserved_total is not None
+        else "sum_of_coverage_columns"
+    )
+    return "".join(lines), {
+        "contigs": len(contig_lengths),
+        "bp": sum(contig_lengths.values()),
+        "extra_depth_rows_ignored": extra_rows,
+        "depth_source_count": len(inputs),
+        "depth_sources": source_metadata,
+        "coverage_source_columns": coverage_source_names,
+        "coverage_columns": coverage_names,
+        "coverage_column_count": len(coverage_names),
+        "total_avg_depth_policy": total_policy,
+    }
+
+
+def normalized_depth_text(
+    source: Path,
+    contig_lengths: OrderedDict[str, int],
+    sample: str,
+) -> tuple[str, dict[str, object]]:
+    """Backward-compatible one-file normalization helper."""
+
+    return normalized_depth_inputs(
+        (DepthInput(source.resolve()),),
+        contig_lengths,
+        sample,
+    )
+
+
+def normalize_taxonomy(
+    source: Path,
+    destination: Optional[Path],
+    contig_lengths: OrderedDict[str, int],
+) -> None:
+    if not source.is_file() or source.stat().st_size == 0:
+        raise UserError(f"taxonomy table does not exist or is empty: {source}")
+    with open_text(source) as handle:
+        header = handle.readline().rstrip("\r\n").split("\t")
+        if len(header) < 2:
+            raise UserError(f"taxonomy table requires two columns: {source}")
+        id_index = next(
+            (
+                header.index(name)
+                for name in (
+                    "contigs",
+                    "contig_id",
+                    "contigName",
+                    "contigname",
+                )
+                if name in header
+            ),
+            0,
+        )
+        taxonomy_index = next(
+            (
+                header.index(name)
+                for name in ("predictions", "taxonomy", "lineage")
+                if name in header
+            ),
+            1,
+        )
+        observed: dict[str, str] = {}
+        for line_number, raw_line in enumerate(handle, start=2):
+            fields = raw_line.rstrip("\r\n").split("\t")
+            if max(id_index, taxonomy_index) >= len(fields):
+                raise UserError(
+                    f"{source}: malformed taxonomy row at line {line_number}"
+                )
+            identifier = fields[id_index]
+            if identifier not in contig_lengths:
+                continue
+            if identifier in observed:
+                raise UserError(
+                    f"{source}: duplicate taxonomy for {identifier!r}"
+                )
+            observed[identifier] = fields[taxonomy_index]
+    missing = [
+        identifier for identifier in contig_lengths if identifier not in observed
+    ]
+    if missing:
+        raise UserError(
+            f"{len(missing)} FASTA contigs lack taxonomy rows; "
+            f"examples={missing[:10]}"
+        )
+    content = "contigs\tpredictions\n" + "".join(
+        f"{identifier}\t{observed[identifier]}\n"
+        for identifier in contig_lengths
+    )
+    if destination is not None:
+        atomic_text(destination, content)
+
+
+def resolve_taxonomy_input(
+    source: Path,
+    *,
+    contigs: Optional[Path] = None,
+    sample: Optional[str] = None,
+    minimum_contig_bp: Optional[int] = None,
+) -> tuple[Path, str]:
+    """Resolve a plain TSV or a checksum-bearing taxonomy result directory."""
+
+    resolved = source.expanduser().resolve()
+    if not resolved.is_dir():
+        return resolved, "table"
+
+    taxonomy = resolved / "taxonomy.tsv"
+    summary_path = resolved / "summary.json"
+    complete_path = resolved / ".complete.json"
+    missing = [
+        path.name
+        for path in (taxonomy, summary_path, complete_path)
+        if not path.is_file()
+    ]
+    if missing:
+        raise UserError(
+            f"taxonomy result directory is incomplete: {resolved}; "
+            f"missing={missing}"
+        )
+    try:
+        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        complete = json.loads(complete_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise UserError(
+            f"cannot read taxonomy result metadata in {resolved}: {error}"
+        ) from error
+
+    taxonomy_sha256 = sha256_file(taxonomy)
+    summary_sha256 = sha256_file(summary_path)
+    if (
+        summary.get("command") != "taxonomy"
+        or summary.get("taxonomy_sha256") != taxonomy_sha256
+        or complete.get("taxonomy_sha256") != taxonomy_sha256
+        or complete.get("summary_sha256") != summary_sha256
+    ):
+        raise UserError(
+            f"taxonomy result checksum or command metadata is invalid: {resolved}"
+        )
+    if contigs is not None:
+        contigs_sha256 = sha256_file(contigs.expanduser().resolve())
+        if summary.get("contigs_sha256") != contigs_sha256:
+            raise UserError(
+                "taxonomy result was created from different contigs: "
+                f"{resolved}"
+            )
+    if sample is not None and summary.get("sample") != sample:
+        raise UserError(
+            f"taxonomy result sample is {summary.get('sample')!r}, "
+            f"not {sample!r}: {resolved}"
+        )
+    if (
+        minimum_contig_bp is not None
+        and summary.get("minimum_contig_bp") != minimum_contig_bp
+    ):
+        raise UserError(
+            "taxonomy result uses a different --min-contig-bp "
+            f"({summary.get('minimum_contig_bp')!r} instead of "
+            f"{minimum_contig_bp}): {resolved}"
+        )
+    return taxonomy, "result_directory"
+
+
+def parse_choices(
+    value: str,
+    supported: Sequence[str],
+    label: str,
+) -> tuple[str, ...]:
+    if value == "all":
+        return tuple(supported)
+    values = tuple(part.strip().lower() for part in value.split(",") if part.strip())
+    if not values:
+        raise UserError(f"{label} is empty")
+    unknown = sorted(set(values).difference(supported))
+    duplicates = sorted({item for item in values if values.count(item) > 1})
+    if unknown:
+        raise UserError(f"unsupported {label}: {unknown}")
+    if duplicates:
+        raise UserError(f"duplicate {label}: {duplicates}")
+    return values
+
+
+def executable(name: str, label: str) -> str:
+    resolved = shutil.which(name)
+    if resolved is None:
+        raise UserError(f"{label} executable not found on PATH: {name}")
+    return resolved
+
+
+def directory_state(path: Optional[Path], required: Sequence[str]) -> dict[str, object]:
+    if path is None:
+        return {"ok": False, "path": None, "error": "not configured"}
+    resolved = path.expanduser().resolve()
+    missing = [
+        relative
+        for relative in required
+        if not (resolved / relative).exists()
+    ]
+    return {
+        "ok": resolved.is_dir() and not missing,
+        "path": str(resolved),
+        "missing": missing,
+        "error": (
+            ""
+            if resolved.is_dir() and not missing
+            else "directory missing or incomplete"
+        ),
+    }
+
+
+def kunpeng_database_state(path: Optional[Path]) -> dict[str, object]:
+    """Validate a Kun-peng sharded database without reading every shard."""
+
+    if path is None:
+        return {"ok": False, "path": None, "error": "not configured"}
+    resolved = path.expanduser().resolve()
+    required = ("hash_config.k2d", "opts.k2d", "taxo.k2d")
+    missing = [
+        name
+        for name in required
+        if not (resolved / name).is_file()
+        or (resolved / name).stat().st_size == 0
+    ]
+    state: dict[str, object] = {
+        "ok": False,
+        "path": str(resolved),
+        "missing": missing,
+        "error": "directory missing or incomplete",
+    }
+    if not resolved.is_dir() or missing:
+        return state
+
+    config_path = resolved / "hash_config.k2d"
+    try:
+        config = config_path.read_bytes()
+        if len(config) != 48:
+            raise ValueError(
+                f"hash_config.k2d must be 48 bytes, observed {len(config)}"
+            )
+        (
+            version,
+            partition,
+            hash_capacity,
+            capacity,
+            size,
+            value_bits,
+        ) = struct.unpack("<6Q", config)
+        if (
+            partition < 1
+            or hash_capacity < 1
+            or capacity < 1
+            or size > capacity
+            or not 1 <= value_bits <= 63
+        ):
+            raise ValueError("hash_config.k2d contains invalid values")
+
+        expected_names = {
+            f"hash_{index}.k2d" for index in range(1, partition + 1)
+        }
+        observed_paths = sorted(
+            item
+            for item in resolved.glob("hash_*.k2d")
+            if re.fullmatch(r"hash_[1-9][0-9]*\.k2d", item.name)
+        )
+        observed_names = {item.name for item in observed_paths}
+        if observed_names != expected_names:
+            missing_shards = sorted(expected_names - observed_names)
+            extra_shards = sorted(observed_names - expected_names)
+            raise ValueError(
+                "shard set does not match hash_config.k2d: "
+                f"missing={missing_shards[:10]}, extra={extra_shards[:10]}"
+            )
+
+        shard_capacity_sum = 0
+        shard_bytes = 0
+        for index in range(1, partition + 1):
+            shard = resolved / f"hash_{index}.k2d"
+            with shard.open("rb") as handle:
+                header = handle.read(16)
+            if len(header) != 16:
+                raise ValueError(f"short shard header: {shard}")
+            observed_index, observed_capacity = struct.unpack("<2Q", header)
+            expected_size = 16 + observed_capacity * 4
+            if observed_index != index:
+                raise ValueError(
+                    f"{shard.name}: header index {observed_index} != {index}"
+                )
+            if not 1 <= observed_capacity <= hash_capacity:
+                raise ValueError(
+                    f"{shard.name}: invalid shard capacity {observed_capacity}"
+                )
+            if shard.stat().st_size != expected_size:
+                raise ValueError(
+                    f"{shard.name}: size {shard.stat().st_size} != "
+                    f"{expected_size}"
+                )
+            shard_capacity_sum += observed_capacity
+            shard_bytes += expected_size
+        if shard_capacity_sum != capacity:
+            raise ValueError(
+                f"shard capacity sum {shard_capacity_sum} != {capacity}"
+            )
+    except (OSError, ValueError, struct.error) as error:
+        state["error"] = str(error)
+        return state
+
+    metadata_path = next(
+        (
+            candidate
+            for candidate in (
+                resolved / "eukbinminer-kunpeng-db.json",
+                resolved / "eukmagminer-kunpeng-db.json",
+            )
+            if candidate.is_file()
+        ),
+        resolved / "eukbinminer-kunpeng-db.json",
+    )
+    metadata: Optional[dict[str, object]] = None
+    if metadata_path.is_file():
+        try:
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            state["error"] = f"invalid database metadata: {error}"
+            return state
+
+    state.update(
+        {
+            "ok": True,
+            "error": "",
+            "version": version,
+            "partitions": partition,
+            "hash_capacity": hash_capacity,
+            "capacity": capacity,
+            "size": size,
+            "value_bits": value_bits,
+            "shard_bytes": shard_bytes,
+            "shard_gib": round(shard_bytes / (1024**3), 3),
+            "metadata": metadata,
+        }
+    )
+    return state
+
+
+def doctor_report(args: argparse.Namespace) -> dict[str, object]:
+    binners = parse_choices(args.binners, BINNERS, "binners")
+    qc_tools = parse_choices(args.qc_tools, QC_TOOLS, "QC tools")
+
+    checks: list[dict[str, object]] = []
+
+    def add_executable(label: str, name: str) -> None:
+        resolved = shutil.which(name)
+        checks.append(
+            {
+                "kind": "executable",
+                "name": label,
+                "requested": name,
+                "resolved": resolved,
+                "ok": resolved is not None,
+            }
+        )
+
+    checks.append(
+        {
+            "kind": "executable",
+            "name": "Python",
+            "requested": sys.executable,
+            "resolved": str(Path(sys.executable).resolve()),
+            "ok": Path(sys.executable).is_file(),
+        }
+    )
+    add_executable("bash", "bash")
+    add_executable("seqkit", "seqkit")
+    for tool in (*binners, *qc_tools):
+        if tool in {"vamb", "taxvamb"}:
+            continue
+        add_executable(tool, tool)
+    if any(item in binners for item in ("vamb", "taxvamb")):
+        add_executable("vamb", "vamb")
+    if "taxvamb" in binners and args.taxonomy is None:
+        add_executable("Kun-peng", "kun_peng")
+
+    databases: dict[str, dict[str, object]] = {}
+    if "eukcc" in qc_tools:
+        value = args.eukcc_db or environment_value("EUKCC_DB")
+        databases["eukcc"] = directory_state(
+            Path(value) if value else None,
+            (),
+        )
+    if "busco" in qc_tools:
+        value = args.busco_db or environment_value("BUSCO_DB")
+        databases["busco"] = directory_state(
+            Path(value) if value else None,
+            ("dataset.cfg", "hmms"),
+        )
+    if "taxvamb" in binners:
+        if args.taxonomy is not None:
+            taxonomy, taxonomy_kind = resolve_taxonomy_input(args.taxonomy)
+            databases["taxonomy"] = {
+                "ok": taxonomy.is_file() and taxonomy.stat().st_size > 0,
+                "path": str(taxonomy),
+                "input_kind": taxonomy_kind,
+                "error": (
+                    ""
+                    if taxonomy.is_file() and taxonomy.stat().st_size > 0
+                    else "file missing or empty"
+                ),
+            }
+        else:
+            value = args.kunpeng_db or environment_value("KUNPENG_DB")
+            databases["kunpeng"] = kunpeng_database_state(
+                Path(value) if value else None
+            )
+    ok = all(bool(check["ok"]) for check in checks) and all(
+        bool(database["ok"]) for database in databases.values()
+    )
+    return {
+        "schema_version": 1,
+        "tool": TOOL_NAME,
+        "version": VERSION,
+        "ok": ok,
+        "binners": list(binners),
+        "qc_tools": list(qc_tools),
+        "execution_mode": "current_environment_path",
+        "checks": checks,
+        "databases": databases,
+    }
+
+
+def write_env(path: Path, values: dict[str, object]) -> None:
+    lines = [
+        f"{key}={shlex.quote(str(value))}\n"
+        for key, value in sorted(values.items())
+        if value is not None
+    ]
+    atomic_text(path, "".join(lines))
+
+
+def run_logged(
+    command: Sequence[str],
+    log_path: Path,
+    *,
+    environment: Optional[dict[str, str]] = None,
+) -> int:
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    note("run: " + " ".join(shlex.quote(item) for item in command))
+    with log_path.open("at", encoding="utf-8", newline="\n") as log:
+        completed = subprocess.run(
+            list(command),
+            check=False,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            text=True,
+            env=environment,
+        )
+    return completed.returncode
+
+
+def make_manifest(path: Path, study: str, sample: str, depth: Path) -> None:
+    atomic_text(
+        path,
+        "rank\tstudy\tsample\teuk_fasta\tunknown_fasta\tdepth_tsv\t"
+        "selection_hash\n"
+        f"1\t{study}\t{sample}\t\t\t{depth.resolve()}\tstandalone\n",
+    )
+
+
+def prepare_vamb_input(
+    preflight_dir: Path,
+    output_dir: Path,
+    study: str,
+    sample: str,
+) -> None:
+    if output_dir.exists():
+        try:
+            metadata = json.loads((output_dir / "input.json").read_text())
+            for name in ("input.fa", "abundance.tsv"):
+                if sha256_file(output_dir / name) != metadata["outputs"][name]["sha256"]:
+                    raise ValueError(f"checksum mismatch for {name}")
+            if sha256_file(output_dir / "input.fa") != sha256_file(preflight_dir / "union.fa"):
+                raise ValueError("cached FASTA differs from prepared input")
+        except (OSError, KeyError, ValueError) as error:
+            raise UserError(f"partial or changed VAMB input: {output_dir}: {error}") from error
+        return
+    output_dir.parent.mkdir(parents=True, exist_ok=True)
+    stage = Path(
+        tempfile.mkdtemp(prefix=f".{output_dir.name}.", dir=output_dir.parent)
+    )
+    try:
+        shutil.copy2(preflight_dir / "union.fa", stage / "input.fa")
+        coverage = preflight_dir / "union.concoct.coverage.tsv"
+        with coverage.open("rt", encoding="utf-8") as source:
+            header = source.readline().rstrip("\r\n").split("\t")
+            if len(header) < 2 or header[0] != "contig_id":
+                raise UserError(f"invalid prepared coverage: {coverage}")
+            coverage_columns = header[1:]
+            if (
+                any(not name or name != name.strip() for name in coverage_columns)
+                or len(set(coverage_columns)) != len(coverage_columns)
+            ):
+                raise UserError(
+                    f"invalid prepared coverage column names: {coverage}"
+                )
+            seen_ids: set[str] = set()
+            abundance_rows = 0
+            abundance_data: list[tuple[str, list[str]]] = []
+            nonzero_coverage = [False] * len(coverage_columns)
+            for line_number, raw_line in enumerate(source, start=2):
+                row = raw_line.rstrip("\r\n")
+                if not row:
+                    continue
+                fields = row.split("\t")
+                if len(fields) != len(header):
+                    raise UserError(
+                        f"invalid prepared coverage row {line_number}: {coverage}"
+                    )
+                identifier = fields[0]
+                if not identifier or identifier in seen_ids:
+                    raise UserError(
+                        f"invalid or duplicate prepared coverage ID "
+                        f"{identifier!r}: {coverage}"
+                    )
+                seen_ids.add(identifier)
+                for column_index, (name, value) in enumerate(
+                    zip(coverage_columns, fields[1:])
+                ):
+                    parsed = _nonnegative_depth_value(
+                        value,
+                        source=coverage,
+                        identifier=identifier,
+                        column=name,
+                        line_number=line_number,
+                    )
+                    if parsed != 0.0:
+                        nonzero_coverage[column_index] = True
+                abundance_data.append((identifier, fields[1:]))
+                abundance_rows += 1
+        kept_indices = tuple(
+            index
+            for index, is_nonzero in enumerate(nonzero_coverage)
+            if is_nonzero
+        )
+        if not kept_indices:
+            raise UserError(
+                "all prepared coverage columns are zero; refusing to invent "
+                "an abundance dimension for VAMB/TaxVAMB"
+            )
+        original_coverage_columns = coverage_columns
+        coverage_columns = [
+            original_coverage_columns[index] for index in kept_indices
+        ]
+        with (stage / "abundance.tsv").open(
+            "wt", encoding="utf-8", newline="\n"
+        ) as target:
+            target.write("contigname\t" + "\t".join(coverage_columns) + "\n")
+            for identifier, values in abundance_data:
+                target.write(
+                    identifier
+                    + "\t"
+                    + "\t".join(values[index] for index in kept_indices)
+                    + "\n"
+                )
+        preflight = json.loads(
+            (preflight_dir / "preflight.json").read_text(encoding="utf-8")
+        )
+        collection = preflight["collections"]["union"]
+        if abundance_rows != int(collection["contigs"]):
+            raise UserError(
+                f"prepared abundance row count differs from preflight: "
+                f"{abundance_rows} != {collection['contigs']}"
+            )
+        metadata = {
+            "schema_version": 5,
+            "rank": 1,
+            "study": study,
+            "sample": sample,
+            "selection_hash": "standalone",
+            "minimum_contig_bp": preflight["filter"][
+                "minimum_contig_bp"
+            ],
+            "abundance_order": "input_fasta",
+            "abundance_rows": abundance_rows,
+            "coverage_columns": coverage_columns,
+            "coverage_column_count": len(coverage_columns),
+            "original_coverage_columns": original_coverage_columns,
+            "original_coverage_column_count": len(original_coverage_columns),
+            "dropped_all_zero_coverage_columns": [
+                name
+                for name in original_coverage_columns
+                if name not in set(coverage_columns)
+            ],
+            "dropped_all_zero_coverage_column_count": (
+                len(original_coverage_columns) - len(coverage_columns)
+            ),
+            "all_zero_coverage_policy": (
+                "drop_only_columns_exactly_zero_for_every_selected_contig;"
+                "fail_closed_if_none_remain"
+            ),
+            "contigs": int(collection["contigs"]),
+            "bp": int(collection["bp"]),
+            "outputs": {
+                name: {
+                    "path": name,
+                    "sha256": sha256_file(stage / name),
+                    "bytes": (stage / name).stat().st_size,
+                }
+                for name in ("input.fa", "abundance.tsv")
+            },
+        }
+        atomic_text(
+            stage / "input.json",
+            json.dumps(metadata, indent=2, sort_keys=True) + "\n",
+        )
+        os.replace(stage, output_dir)
+    except Exception:
+        shutil.rmtree(stage, ignore_errors=True)
+        raise
+
+
+def successful_binners(
+    results_root: Path,
+    study: str,
+    sample: str,
+    requested: Iterable[str],
+) -> tuple[str, ...]:
+    sample_root = results_root / study / sample
+    base = sample_root / "results" / "union"
+    successful: set[str] = set()
+    classic_status = sample_root / "branch_status.tsv"
+    if classic_status.is_file():
+        _, rows = read_tsv(classic_status)
+        successful.update(
+            row["binner"] for row in rows
+            if row.get("input_set") == "union"
+            and row.get("status") in {"success", "completed"}
+            and row.get("exit_code") == "0"
+        )
+    vamb_status = results_root.parent / "status/binner/r000001.status.tsv"
+    if vamb_status.is_file():
+        _, rows = read_tsv(vamb_status)
+        states = {row["field"]: row["value"] for row in rows}
+        successful.update(
+            binner for binner in ("vamb", "taxvamb")
+            if states.get(f"{binner}_status") == "0"
+        )
+    return tuple(
+        binner for binner in requested
+        if binner in successful
+        and (base / binner / "bins").is_dir()
+        and (base / binner / "audit/audit.json").is_file()
+        and (base / binner / "fingerprint.json").is_file()
+    )
+
+
+def read_tsv(path: Path) -> tuple[list[str], list[dict[str, str]]]:
+    with path.open("rt", encoding="utf-8", newline="") as handle:
+        reader = csv.DictReader(handle, delimiter="\t")
+        return list(reader.fieldnames or []), list(reader)
+
+
+def write_tsv(
+    path: Path,
+    columns: Sequence[str],
+    rows: Iterable[dict[str, object]],
+) -> None:
+    lines = ["\t".join(columns) + "\n"]
+    lines.extend(
+        "\t".join(
+            str(row.get(column, ""))
+            .replace("\t", " ")
+            .replace("\r", " ")
+            .replace("\n", " ")
+            for column in columns
+        )
+        + "\n"
+        for row in rows
+    )
+    atomic_text(path, "".join(lines))
+
+
+def qc_metrics(
+    completeness: str,
+    contamination: str,
+    *,
+    min_completeness: float,
+    max_contamination: float,
+    contamination_penalty: float,
+) -> tuple[str, str]:
+    try:
+        complete_value = float(completeness)
+        contamination_value = float(contamination)
+    except (TypeError, ValueError):
+        return "no", ""
+    if not (
+        math.isfinite(complete_value)
+        and math.isfinite(contamination_value)
+        and 0.0 <= complete_value <= 100.0
+        and contamination_value >= 0.0
+    ):
+        return "no", ""
+    passed = (
+        complete_value >= min_completeness
+        and contamination_value <= max_contamination
+    )
+    quality_score = complete_value - contamination_penalty * contamination_value
+    return ("yes" if passed else "no"), f"{quality_score:g}"
+
+
+def decision_table(
+    args: argparse.Namespace,
+    eukcc_merged: Path,
+    busco_merged: Path,
+    output: Path,
+) -> None:
+    if args.decision_qc == "eukcc":
+        columns, rows = read_tsv(eukcc_merged)
+        output_columns = [
+            *columns,
+            "decision_qc",
+            "contamination_source",
+            "qc_pass",
+            "quality_score",
+        ]
+        for row in rows:
+            passed, score = qc_metrics(
+                row.get("completeness", ""),
+                row.get("contamination", ""),
+                min_completeness=args.min_completeness,
+                max_contamination=args.max_contamination,
+                contamination_penalty=args.contamination_penalty,
+            )
+            if row.get("eukcc_status") != "ok":
+                passed, score = "no", ""
+            row.update(
+                {
+                    "decision_qc": "eukcc",
+                    "contamination_source": "eukcc_contamination",
+                    "qc_pass": passed,
+                    "quality_score": score,
+                }
+            )
+    else:
+        columns, rows = read_tsv(busco_merged)
+        output_columns = [
+            *columns,
+            "completeness",
+            "contamination",
+            "decision_qc",
+            "contamination_source",
+            "qc_pass",
+            "quality_score",
+        ]
+        for row in rows:
+            completeness = row.get("busco_complete", "")
+            contamination = row.get("busco_duplicated", "")
+            passed, score = qc_metrics(
+                completeness,
+                contamination,
+                min_completeness=args.min_completeness,
+                max_contamination=args.max_contamination,
+                contamination_penalty=args.contamination_penalty,
+            )
+            if row.get("busco_status") != "ok":
+                passed, score = "no", ""
+            row.update(
+                {
+                    "completeness": completeness,
+                    "contamination": contamination,
+                    "decision_qc": "busco",
+                    "contamination_source": "busco_duplicated",
+                    "qc_pass": passed,
+                    "quality_score": score,
+                }
+            )
+    write_tsv(output, output_columns, rows)
+
+
+def materialize_representatives(
+    selection_dir: Path,
+    destination: Path,
+) -> Path:
+    _, rows = read_tsv(selection_dir / "representatives.tsv")
+    if destination.exists():
+        raise UserError(f"partial non-redundant MAG directory exists: {destination}")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    stage = Path(
+        tempfile.mkdtemp(
+            prefix=f".{destination.name}.",
+            dir=destination.parent,
+        )
+    )
+    manifest_rows: list[dict[str, object]] = []
+    try:
+        for row in rows:
+            source = Path(row["bin_path"]).resolve()
+            name = f"{row['representative_bin_id']}.fa"
+            target = stage / name
+            shutil.copy2(source, target)
+            manifest_rows.append(
+                {
+                    "representative_bin_id": row["representative_bin_id"],
+                    "selected_binner": row["selected_binner"],
+                    "source_path": source,
+                    "mag_path": destination / name,
+                    "sha256": sha256_file(target),
+                    "bytes": target.stat().st_size,
+                }
+            )
+        manifest = stage / "manifest.tsv"
+        write_tsv(
+            manifest,
+            (
+                "representative_bin_id",
+                "selected_binner",
+                "source_path",
+                "mag_path",
+                "sha256",
+                "bytes",
+            ),
+            manifest_rows,
+        )
+        os.replace(stage, destination)
+    except Exception:
+        shutil.rmtree(stage, ignore_errors=True)
+        raise
+    return destination / "manifest.tsv"
+
+
+def validate_args(args: argparse.Namespace) -> None:
+    args.binner_list = parse_choices(args.binners, BINNERS, "binners")
+    args.qc_list = parse_choices(args.qc_tools, QC_TOOLS, "QC tools")
+    if args.decision_qc not in args.qc_list:
+        raise UserError("--decision-qc must also occur in --qc-tools")
+    if args.retain_min_bin_bp < 1:
+        raise UserError("--retain-min-bin-bp must be positive")
+    if args.qc_min_bin_bp < args.retain_min_bin_bp:
+        raise UserError(
+            "--qc-min-bin-bp must be >= --retain-min-bin-bp"
+        )
+    if not 0.0 < args.overlap_threshold <= 1.0:
+        raise UserError("--overlap-threshold must be in (0, 1]")
+    if (
+        not math.isfinite(args.contamination_penalty)
+        or args.contamination_penalty < 0
+    ):
+        raise UserError("--contamination-penalty must be non-negative")
+    if (
+        not math.isfinite(args.min_completeness)
+        or not 0.0 <= args.min_completeness <= 100.0
+    ):
+        raise UserError("--min-completeness must be in [0, 100]")
+    if (
+        not math.isfinite(args.max_contamination)
+        or not 0.0 <= args.max_contamination <= 100.0
+    ):
+        raise UserError("--max-contamination must be in [0, 100]")
+    if args.threads < 1:
+        raise UserError("--threads must be positive")
+    if not 1 <= args.random_seed <= 4294967295:
+        raise UserError("--random-seed must be positive and at most 4294967295")
+    if args.min_contig_bp < 1:
+        raise UserError("--min-contig-bp must be positive")
+    if args.taxonomy is not None and args.kunpeng_db is not None:
+        raise UserError("--taxonomy and --kunpeng-db are mutually exclusive")
+    if "taxvamb" not in args.binner_list and (
+        args.taxonomy is not None or args.kunpeng_db is not None
+    ):
+        raise UserError(
+            "--taxonomy and --kunpeng-db are only meaningful when taxvamb "
+            "is selected"
+        )
+    if args.sample in {".", ".."} or not re.fullmatch(r"[A-Za-z0-9._-]+", args.sample):
+        raise UserError(
+            "--sample must contain only letters, digits, dot, underscore, hyphen"
+        )
+    if args.study in {".", ".."} or not re.fullmatch(r"[A-Za-z0-9._-]+", args.study):
+        raise UserError(
+            "--study must contain only letters, digits, dot, underscore, hyphen"
+        )
+
+
+def validate_inputs(args: argparse.Namespace) -> dict[str, object]:
+    contigs = args.contigs.resolve()
+    depth_inputs = parse_depth_inputs(args.depth)
+    lengths = fasta_lengths(contigs, allow_empty=True)
+    eligible_lengths = OrderedDict(
+        (identifier, length)
+        for identifier, length in lengths.items()
+        if length >= args.min_contig_bp
+    )
+    depth_text, depth_summary = normalized_depth_inputs(
+        depth_inputs,
+        lengths,
+        args.sample,
+    )
+    taxonomy_state = "not_requested"
+    if "taxvamb" in args.binner_list:
+        if args.taxonomy is not None:
+            taxonomy_path, taxonomy_kind = resolve_taxonomy_input(
+                args.taxonomy,
+                contigs=contigs,
+                sample=args.sample,
+                minimum_contig_bp=args.min_contig_bp,
+            )
+            normalize_taxonomy(
+                taxonomy_path,
+                None,
+                eligible_lengths,
+            )
+            taxonomy_state = (
+                "reusable_result"
+                if taxonomy_kind == "result_directory"
+                else "provided_table"
+            )
+        else:
+            kunpeng_db_value = args.kunpeng_db or environment_value(
+                "KUNPENG_DB"
+            )
+            if not kunpeng_db_value:
+                raise UserError(
+                    "taxvamb needs --taxonomy, --kunpeng-db, or "
+                    "EUKBINMINER_KUNPENG_DB"
+                )
+            kunpeng_state = kunpeng_database_state(Path(kunpeng_db_value))
+            if not kunpeng_state["ok"]:
+                raise UserError(
+                    "Kun-peng database is incomplete or invalid: "
+                    f"{kunpeng_state['path']}: {kunpeng_state['error']}"
+                )
+            taxonomy_state = "kunpeng"
+    eukcc_db_value = args.eukcc_db or environment_value("EUKCC_DB")
+    busco_db_value = args.busco_db or environment_value("BUSCO_DB")
+    if "eukcc" in args.qc_list:
+        eukcc_state = directory_state(
+            Path(eukcc_db_value) if eukcc_db_value else None,
+            (),
+        )
+        if not eukcc_state["ok"]:
+            raise UserError(
+                "EukCC needs a valid --eukcc-db or "
+                "EUKBINMINER_EUKCC_DB"
+            )
+    if "busco" in args.qc_list:
+        busco_state = directory_state(
+            Path(busco_db_value) if busco_db_value else None,
+            ("dataset.cfg", "hmms"),
+        )
+        if not busco_state["ok"]:
+            raise UserError(
+                "BUSCO needs an unpacked --busco-db or "
+                "EUKBINMINER_BUSCO_DB containing dataset.cfg and hmms/"
+            )
+    qc_references = {
+        "eukcc_db": (
+            str(Path(eukcc_db_value).expanduser().resolve())
+            if "eukcc" in args.qc_list and eukcc_db_value
+            else None
+        ),
+        "busco_db": (
+            str(Path(busco_db_value).expanduser().resolve())
+            if "busco" in args.qc_list and busco_db_value
+            else None
+        ),
+    }
+    return {
+        "sample": args.sample,
+        "study": args.study,
+        "contigs": len(lengths),
+        "bp": sum(lengths.values()),
+        "eligible_contigs": len(eligible_lengths),
+        "eligible_bp": sum(eligible_lengths.values()),
+        "depth_rows": depth_summary["contigs"],
+        "normalized_depth_bytes": len(depth_text.encode("utf-8")),
+        "depth_source_count": depth_summary["depth_source_count"],
+        "depth_sources": depth_summary["depth_sources"],
+        "coverage_source_columns": depth_summary[
+            "coverage_source_columns"
+        ],
+        "coverage_columns": depth_summary["coverage_columns"],
+        "coverage_column_count": depth_summary["coverage_column_count"],
+        "total_avg_depth_policy": depth_summary[
+            "total_avg_depth_policy"
+        ],
+        "binners": list(args.binner_list),
+        "qc_tools": list(args.qc_list),
+        "decision_qc": args.decision_qc,
+        "random_seed": args.random_seed,
+        "contamination_source": (
+            "eukcc_contamination"
+            if args.decision_qc == "eukcc"
+            else "busco_duplicated"
+        ),
+        "min_completeness": args.min_completeness,
+        "max_contamination": args.max_contamination,
+        "contamination_penalty": args.contamination_penalty,
+        "qc_references": qc_references,
+        "taxonomy": taxonomy_state,
+        "retain_min_bin_bp": args.retain_min_bin_bp,
+        "qc_min_bin_bp": args.qc_min_bin_bp,
+        "min_contig_bp": args.min_contig_bp,
+        "min_completeness": args.min_completeness,
+        "max_contamination": args.max_contamination,
+        "contamination_penalty": args.contamination_penalty,
+        "overlap_threshold": args.overlap_threshold,
+    }
+
+
+def write_classifier_catalogue(
+    source: Path,
+    destination: Path,
+    selected_lengths: OrderedDict[str, int],
+) -> None:
+    """Write selected contigs with the rank prefix used by classifiers."""
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    identifier: Optional[str] = None
+    sequence: list[str] = []
+
+    def finish(handle: IO[str]) -> None:
+        if identifier is None or identifier not in selected_lengths:
+            return
+        observed = "".join(sequence)
+        if len(observed) != selected_lengths[identifier]:
+            raise UserError(
+                f"{source}: sequence length changed while preparing {identifier!r}"
+            )
+        handle.write(f">r000001C{identifier}\n")
+        for start in range(0, len(observed), 80):
+            handle.write(observed[start : start + 80] + "\n")
+
+    with open_text(source) as input_handle, destination.open(
+        "wt", encoding="utf-8", newline="\n"
+    ) as output_handle:
+        for raw_line in input_handle:
+            line = raw_line.rstrip("\r\n")
+            if line.startswith(">"):
+                finish(output_handle)
+                identifier = line[1:].split()[0]
+                sequence = []
+            elif line:
+                sequence.append("".join(line.split()))
+        finish(output_handle)
+
+
+def is_kunpeng_enodata_exit(log_path: Path) -> bool:
+    """Recognize the exact Kun-peng v0.7.12 zero-hit ENODATA failure."""
+
+    try:
+        content = log_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    has_no_data_message = "no data available" in content.lower()
+    has_enodata_identity = bool(
+        re.search(
+            r"(?:\benodata\b|\b(?:os error|code)\s*[:=]?\s*61\b)",
+            content,
+            flags=re.IGNORECASE,
+        )
+    )
+    return has_no_data_message and has_enodata_identity
+
+
+def run_kunpeng_taxonomy(
+    args: argparse.Namespace,
+    *,
+    source: Path,
+    selected_lengths: OrderedDict[str, int],
+    taxonomy_path: Path,
+    artifact_root: Path,
+    work: Path,
+    runtime_root: Path,
+    logs: Path,
+    environment: dict[str, str],
+) -> dict[str, object]:
+    """Classify one sample with Kun-peng and create TaxVAMB taxonomy."""
+
+    database_value = args.kunpeng_db or environment_value("KUNPENG_DB")
+    if not database_value:
+        raise UserError(
+            "taxvamb needs --taxonomy, --kunpeng-db, or "
+            "EUKBINMINER_KUNPENG_DB"
+        )
+    database = Path(database_value).expanduser().resolve()
+    database_state = kunpeng_database_state(database)
+    if not database_state["ok"]:
+        raise UserError(
+            "Kun-peng database is incomplete or invalid: "
+            f"{database}: {database_state['error']}"
+        )
+    kunpeng = Path(executable("kun_peng", "Kun-peng")).resolve()
+
+    chunk_dir = runtime_root / "kunpeng-chunks"
+    if chunk_dir.exists() and any(chunk_dir.iterdir()):
+        raise UserError(f"Kun-peng chunk directory is not empty: {chunk_dir}")
+    chunk_dir.mkdir(parents=True, exist_ok=True)
+    output_dir = artifact_root / "classifier-output"
+    if output_dir.exists() and any(output_dir.iterdir()):
+        raise UserError(f"partial Kun-peng output already exists: {output_dir}")
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    catalogue = work / "kunpeng.catalogue.fa"
+    samples = work / "kunpeng.samples.tsv"
+    converted = work / "kunpeng.converted"
+    write_classifier_catalogue(source, catalogue, selected_lengths)
+    atomic_text(
+        samples,
+        "rank\tstudy\tsample\tprefix\tcontigs\tbp\t"
+        "input_path\tabundance_path\n"
+        f"1\t{args.study}\t{args.sample}\tr000001C\t"
+        f"{len(selected_lengths)}\t{sum(selected_lengths.values())}\t"
+        f"{source}\t\n",
+    )
+
+    command = [
+        str(kunpeng),
+        "classify",
+        "--db",
+        str(database),
+        "--chunk-dir",
+        str(chunk_dir),
+        "--output-dir",
+        str(output_dir),
+        "-p",
+        str(args.threads),
+        "-g",
+        "3",
+        str(catalogue),
+    ]
+    taxonomy_log = logs / "taxonomy.kunpeng.log"
+    rc = run_logged(
+        command,
+        taxonomy_log,
+        environment=environment,
+    )
+    accepted_nonzero_enodata = rc != 0 and is_kunpeng_enodata_exit(
+        taxonomy_log
+    )
+    if rc != 0 and not accepted_nonzero_enodata:
+        raise UserError(
+            "Kun-peng taxonomy failed; see "
+            f"{taxonomy_log}"
+        )
+
+    classification_outputs = sorted(output_dir.glob("output_*.txt"))
+    reports = sorted(output_dir.glob("output_*.kreport2"))
+    if len(classification_outputs) != 1 or len(reports) != 1:
+        raise UserError(
+            "Kun-peng must produce exactly one sequence output and one "
+            f"kreport2 for a single input; observed outputs="
+            f"{[item.name for item in classification_outputs]}, reports="
+            f"{[item.name for item in reports]}"
+        )
+
+    from resolve_kunpeng_compat import resolve as resolve_kunpeng_compat
+
+    compatibility_output = work / "kunpeng.compat.output.txt"
+    compatibility_summary = resolve_kunpeng_compat(
+        classification_outputs[0],
+        catalogue,
+        database / "opts.k2d",
+        database / "taxo.k2d",
+        compatibility_output,
+        classification_report=reports[0],
+        minimum_hit_groups=3,
+    )
+    enodata_evidence_mode = "normal_exit"
+    if accepted_nonzero_enodata:
+        omitted = compatibility_summary["raw_omitted_zero_hit_contigs"]
+        raw_output = compatibility_summary["raw_output_contigs"]
+        expected = compatibility_summary["contigs"]
+        if omitted >= 1:
+            enodata_evidence_mode = "zero_hit_omission"
+        elif raw_output == expected:
+            # resolve_kunpeng_compat has already required one record per FASTA
+            # identifier and exact agreement between output, report and FASTA.
+            enodata_evidence_mode = "complete_output_report_consistent"
+        else:
+            compatibility_output.unlink(missing_ok=True)
+            raise UserError(
+                "Kun-peng reported ENODATA/OS error 61, but neither a "
+                "zero-hit omission nor a complete output/report identity "
+                "was proved"
+            )
+        note(
+            "accepted Kun-peng ENODATA/OS error 61 after strict "
+            f"output/report validation mode={enodata_evidence_mode}"
+        )
+
+    from classifier_to_taxvamb import convert as convert_classifier_output
+
+    convert_classifier_output(
+        compatibility_output,
+        reports[0],
+        samples,
+        converted,
+        classification_taxonomy=database / "taxo.k2d",
+    )
+    taxonomy_path.parent.mkdir(parents=True, exist_ok=True)
+    normalize_taxonomy(
+        converted / "per_sample" / "r000001.taxonomy.tsv",
+        taxonomy_path,
+        selected_lengths,
+    )
+
+    compressed_output = artifact_root / "kunpeng.output.txt.gz"
+    compressed_compatibility_output = (
+        artifact_root / "kunpeng.compat.output.txt.gz"
+    )
+    retained_report = artifact_root / "kunpeng.kreport2"
+    with classification_outputs[0].open("rb") as source_handle, gzip.open(
+        compressed_output,
+        "wb",
+        compresslevel=1,
+    ) as target_handle:
+        shutil.copyfileobj(source_handle, target_handle)
+    with compatibility_output.open("rb") as source_handle, gzip.open(
+        compressed_compatibility_output,
+        "wb",
+        compresslevel=1,
+    ) as target_handle:
+        shutil.copyfileobj(source_handle, target_handle)
+    shutil.copy2(reports[0], retained_report)
+    version_result = subprocess.run(
+        [str(kunpeng), "--version"],
+        check=False,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        env=environment,
+    )
+    provenance = {
+        "schema_version": 2,
+        "backend": "kunpeng",
+        "release_tag": KUNPENG_RELEASE_TAG,
+        "release_commit": KUNPENG_RELEASE_COMMIT,
+        "hpc_release_binary_sha256": KUNPENG_HPC_BINARY_SHA256,
+        "executable": str(kunpeng),
+        "executable_sha256": sha256_file(kunpeng),
+        "reported_version": version_result.stdout.strip(),
+        "database": str(database),
+        "database_state": database_state,
+        "minimum_hit_groups": 3,
+        "classifier_exit_code": rc,
+        "accepted_nonzero_enodata": accepted_nonzero_enodata,
+        "enodata_evidence_mode": enodata_evidence_mode,
+        "classifier_log_sha256": sha256_file(taxonomy_log),
+        "threads": args.threads,
+        "selected_contigs": len(selected_lengths),
+        "selected_bp": sum(selected_lengths.values()),
+        "taxonomy_sha256": sha256_file(taxonomy_path),
+        "classification_output_sha256": sha256_file(compressed_output),
+        "raw_classification_output_sha256": sha256_file(compressed_output),
+        "compatibility_classification_output_sha256": sha256_file(
+            compressed_compatibility_output
+        ),
+        "classification_report_sha256": sha256_file(retained_report),
+        "compatibility_resolution": {
+            key: value
+            for key, value in compatibility_summary.items()
+            if key
+            not in {
+                "classification_output",
+                "fasta",
+                "options",
+                "taxonomy",
+            }
+        },
+    }
+    atomic_text(
+        artifact_root / "provenance.json",
+        json.dumps(provenance, indent=2, sort_keys=True) + "\n",
+    )
+
+    shutil.rmtree(chunk_dir)
+    shutil.rmtree(output_dir)
+    shutil.rmtree(converted)
+    compatibility_output.unlink()
+    catalogue.unlink()
+    samples.unlink()
+    return provenance
+
+
+def complete_empty_input_workflow(
+    args: argparse.Namespace,
+    out: Path,
+    input_summary: dict[str, object],
+    complete: Path,
+) -> None:
+    """Write a complete, tool-free result for a valid zero-contig input."""
+
+    from merge_busco import merge as merge_busco
+    from merge_eukcc import merge as merge_eukcc
+    from select_within_sample_representatives import (
+        select as select_representatives,
+    )
+    from seqkit_bin_stats import (
+        CANDIDATE_COLUMNS,
+        STATS_COLUMNS,
+        write_gzip_tsv,
+    )
+
+    results_root = out / "results"
+    sample_results = results_root / args.study / args.sample
+    sample_results.mkdir(parents=True, exist_ok=True)
+    write_tsv(
+        sample_results / "branch_status.tsv",
+        ("input_set", "binner", "status", "exit_code", "result_path"),
+        (
+            {
+                "input_set": "union",
+                "binner": binner,
+                "status": "not_run_empty_input",
+                "exit_code": 0,
+                "result_path": "",
+            }
+            for binner in args.binner_list
+        ),
+    )
+
+    qc_root = out / "qc"
+    seqkit_root = qc_root / "seqkit"
+    seqkit_root.mkdir(parents=True, exist_ok=True)
+    candidates = seqkit_root / "candidates.tsv"
+    stats = seqkit_root / "bin_stats.tsv.gz"
+    stats_done = seqkit_root / ".complete.json"
+    write_tsv(candidates, CANDIDATE_COLUMNS, ())
+    write_gzip_tsv(stats, STATS_COLUMNS, ())
+    stats_payload = {
+        "schema_version": 1,
+        "rank": 1,
+        "study": args.study,
+        "sample": args.sample,
+        "minimum_bp_inclusive": args.qc_min_bin_bp,
+        "binners": list(args.binner_list),
+        "branch_state": {
+            binner: "not_run_empty_input" for binner in args.binner_list
+        },
+        "discovered_bins": 0,
+        "stats_ok": 0,
+        "seqkit_errors": 0,
+        "candidates": 0,
+        "by_binner": {
+            binner: {
+                "discovered": 0,
+                "stats_ok": 0,
+                "seqkit_errors": 0,
+                "candidates": 0,
+            }
+            for binner in args.binner_list
+        },
+        "stats_path": str(stats.resolve()),
+        "stats_sha256": sha256_file(stats),
+        "candidate_manifest": str(candidates.resolve()),
+        "candidate_manifest_sha256": sha256_file(candidates),
+        "empty_input": True,
+    }
+    atomic_text(
+        stats_done,
+        json.dumps(stats_payload, indent=2, sort_keys=True) + "\n",
+    )
+
+    eukcc_merged = qc_root / "eukcc_merged" / "eukcc_merged.tsv"
+    busco_merged = qc_root / "busco_merged.tsv"
+    if "eukcc" in args.qc_list:
+        merge_eukcc(candidates, qc_root / "eukcc", qc_root / "eukcc_merged")
+    if "busco" in args.qc_list:
+        merge_busco(candidates, qc_root / "busco", busco_merged)
+    decision = qc_root / "decision_qc.tsv"
+    decision_table(args, eukcc_merged, busco_merged, decision)
+
+    selection = out / "selection"
+    select_representatives(
+        decision,
+        stats_done,
+        selection,
+        args.overlap_threshold,
+        args.contamination_penalty,
+        args.min_completeness,
+        args.max_contamination,
+    )
+    mags_manifest = materialize_representatives(selection, out / "mags")
+    empty_input_reason = (
+        "no_input_contigs_with_depth"
+        if int(input_summary["contigs"]) == 0
+        else "no_input_contigs_at_minimum_bp"
+    )
+    summary = {
+        "schema_version": 2,
+        "tool": TOOL_NAME,
+        "version": VERSION,
+        "sample": args.sample,
+        "study": args.study,
+        "requested_binners": list(args.binner_list),
+        "completed_binners": [],
+        "qc_tools": list(args.qc_list),
+        "decision_qc": args.decision_qc,
+        "random_seed": args.random_seed,
+        "taxonomy": "not_run_empty_input",
+        "taxonomy_provenance": {
+            "backend": "not_run_empty_input",
+            "reason": empty_input_reason,
+        },
+        "qc_references": input_summary["qc_references"],
+        "discovered_bins": 0,
+        "qc_candidates": 0,
+        "representatives": 0,
+        "alternatives": 0,
+        "empty_input": True,
+        "empty_input_reason": empty_input_reason,
+        "non_redundant_mags": str((out / "mags").resolve()),
+        "mags_manifest_sha256": sha256_file(mags_manifest),
+    }
+    atomic_text(
+        out / "summary.json",
+        json.dumps(summary, indent=2, sort_keys=True) + "\n",
+    )
+    atomic_text(
+        complete,
+        json.dumps(
+            {
+                "run_metadata_sha256": sha256_file(out / "config/run.json"),
+                "summary_sha256": sha256_file(out / "summary.json"),
+                "representatives_sha256": sha256_file(
+                    selection / "representatives.tsv"
+                ),
+                "alternatives_sha256": sha256_file(
+                    selection / "alternatives.tsv"
+                ),
+                "mags_manifest_sha256": sha256_file(mags_manifest),
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+    )
+    note("complete: empty input, 0 representatives, 0 alternatives")
+
+
+def run_workflow(args: argparse.Namespace) -> None:
+    validate_args(args)
+    out = args.output.resolve()
+    out.mkdir(parents=True, exist_ok=True)
+    with (out / ".run.lock").open("a") as lock:
+        try:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise UserError(f"another process owns output directory: {out}") from error
+        run_locked_workflow(args)
+
+
+def verify_complete_output(out: Path) -> None:
+    try:
+        marker = json.loads((out / ".complete.json").read_text())
+        for key, relative in {
+            "summary_sha256": "summary.json",
+            "representatives_sha256": "selection/representatives.tsv",
+            "alternatives_sha256": "selection/alternatives.tsv",
+            "mags_manifest_sha256": "mags/manifest.tsv",
+            "run_metadata_sha256": "config/run.json",
+        }.items():
+            if sha256_file(out / relative) != marker[key]:
+                raise ValueError(f"checksum mismatch for {relative}")
+        _, rows = read_tsv(out / "mags/manifest.tsv")
+        for row in rows:
+            genome = out / "mags" / f"{row['representative_bin_id']}.fa"
+            if sha256_file(genome) != row["sha256"]:
+                raise ValueError(f"checksum mismatch for {genome.name}")
+    except (OSError, KeyError, ValueError) as error:
+        raise UserError(f"completed output is incomplete or modified: {out}: {error}") from error
+
+
+def run_locked_workflow(args: argparse.Namespace) -> None:
+    validate_args(args)
+    input_summary = validate_inputs(args)
+    out = args.output.resolve()
+    complete = out / ".complete.json"
+    depth_inputs = parse_depth_inputs(args.depth)
+    runtime = {
+        **input_summary,
+        "version": VERSION,
+        "contigs_path": str(args.contigs.resolve()),
+        "contigs_sha256": sha256_file(args.contigs.resolve()),
+        "depth_inputs": [
+            {
+                "path": str(depth_input.path),
+                "label": depth_input.label,
+                "sha256": sha256_file(depth_input.path),
+            }
+            for depth_input in depth_inputs
+        ],
+    }
+    if len(depth_inputs) == 1:
+        runtime["depth_path"] = str(depth_inputs[0].path)
+        runtime["depth_sha256"] = sha256_file(depth_inputs[0].path)
+    runtime["threads"] = args.threads
+    runtime["taxonomy_input"] = None
+    if args.taxonomy is not None:
+        taxonomy_path, _ = resolve_taxonomy_input(
+            args.taxonomy, contigs=args.contigs.resolve(), sample=args.sample,
+            minimum_contig_bp=args.min_contig_bp,
+        )
+        runtime["taxonomy_input"] = {
+            "path": str(taxonomy_path.resolve()), "sha256": sha256_file(taxonomy_path),
+        }
+    runtime["kunpeng_db"] = str(Path(
+        args.kunpeng_db or environment_value("KUNPENG_DB")
+    ).expanduser().resolve()) if input_summary["taxonomy"] == "kunpeng" else None
+    runtime["backend_environments"] = {
+        name: environment_value(name)
+        for name in ("CONDA_EXE", "REMAG_ENV", "CONCOCT_ENV", "METABAT2_ENV",
+                     "EUKCC_ENV", "BUSCO_ENV")
+    }
+    runtime["code_sha256"] = {
+        str(path.relative_to(ROOT)): sha256_file(path)
+        for path in sorted(SCRIPTS.iterdir())
+        if path.suffix in {".py", ".sh"}
+    }
+    runtime["cli_sha256"] = sha256_file(Path(__file__))
+    run_metadata = out / "config/run.json"
+    if run_metadata.is_file():
+        try:
+            previous = json.loads(run_metadata.read_text())
+        except (OSError, ValueError) as error:
+            raise UserError(f"unreadable run metadata: {run_metadata}") from error
+        if previous.get("random_seed") != args.random_seed:
+            raise UserError("completed output random seed differs; use a new output directory")
+        if previous != runtime:
+            raise UserError("output inputs, parameters or software differ; use a new output directory")
+    elif any(path.name != ".run.lock" for path in out.iterdir()):
+        raise UserError("output lacks matching run metadata; use a new output directory")
+    else:
+        atomic_text(run_metadata, json.dumps(runtime, indent=2, sort_keys=True) + "\n")
+    if complete.is_file():
+        verify_complete_output(out)
+        note(f"already complete: {out}")
+        return
+
+    config_dir = out / "config"
+    logs = out / "logs"
+    work = out / "work"
+    runtime_root = work / "runtime"
+    runtime_directories = {
+        "TMPDIR": runtime_root / "tmp",
+        "TEMP": runtime_root / "tmp",
+        "TMP": runtime_root / "tmp",
+        "XDG_CACHE_HOME": runtime_root / "xdg",
+        "TORCH_HOME": runtime_root / "torch",
+        "MPLCONFIGDIR": runtime_root / "matplotlib",
+        "NUMBA_CACHE_DIR": runtime_root / "numba",
+        "PYTHONPYCACHEPREFIX": runtime_root / "pycache",
+        "CONDA_PKGS_DIRS": runtime_root / "conda-pkgs",
+    }
+    for directory in set(runtime_directories.values()):
+        directory.mkdir(parents=True, exist_ok=True)
+    workflow_environment = dict(os.environ)
+    workflow_environment.update(
+        {
+            name: str(directory.resolve())
+            for name, directory in runtime_directories.items()
+        }
+    )
+    results_root = out / "results"
+    preflight = results_root / args.study / args.sample / "preflight"
+    normalized_depth = work / "input" / "depth.jgi.tsv"
+    normalized_depth.parent.mkdir(parents=True, exist_ok=True)
+    depth_inputs = parse_depth_inputs(args.depth)
+    depth_text, _ = normalized_depth_inputs(
+        depth_inputs,
+        fasta_lengths(args.contigs.resolve(), allow_empty=True),
+        args.sample,
+    )
+    if normalized_depth.exists():
+        if normalized_depth.read_text(encoding="utf-8") != depth_text:
+            raise UserError(f"existing normalized depth differs: {normalized_depth}")
+    else:
+        atomic_text(normalized_depth, depth_text)
+
+    manifest = out / "manifest.tsv"
+    make_manifest(manifest, args.study, args.sample, normalized_depth)
+    if int(input_summary["eligible_contigs"]) == 0:
+        complete_empty_input_workflow(
+            args,
+            out,
+            input_summary,
+            complete,
+        )
+        return
+
+    from prepare_inputs import prepare_inputs
+
+    prepare_inputs(
+        euk_fasta=args.contigs.resolve(),
+        unknown_fasta=None,
+        depth_tsv=normalized_depth,
+        sample=args.sample,
+        out_dir=preflight,
+        minimum_length_inclusive=args.min_contig_bp,
+    )
+
+    # Accept only statuses produced by this invocation after branch validation.
+    for status in (
+        results_root / args.study / args.sample / "branch_status.tsv",
+        out / "status/binner/r000001.status.tsv",
+    ):
+        status.unlink(missing_ok=True)
+
+    python = sys.executable
+    classic = tuple(
+        item for item in args.binner_list if item in {"remag", "concoct", "metabat2"}
+    )
+    backend_env = config_dir / "backend.env"
+    env_values: dict[str, object] = {
+        "STUDY": args.study,
+        "SAMPLE": args.sample,
+        "CONTIG_FASTA": args.contigs.resolve(),
+        "DEPTH_TSV": normalized_depth,
+        "OUT_ROOT": results_root,
+        "PIPELINE_DIR": ROOT,
+        "PYTHON_EXE": python,
+        "CONDA_EXE": environment_value("CONDA_EXE") or "conda",
+        "REMAG_ENV": environment_value("REMAG_ENV") or "",
+        "CONCOCT_ENV": environment_value("CONCOCT_ENV") or "",
+        "METABAT2_ENV": environment_value("METABAT2_ENV") or "",
+        "THREADS": args.threads,
+        "RANDOM_SEED": args.random_seed,
+        "MIN_BIN_SIZE": args.retain_min_bin_bp,
+        "INPUT_MIN_CONTIG_BP": args.min_contig_bp,
+        "INPUT_SETS": "union",
+        "BINNERS": " ".join(classic),
+        "CROSS_ACCOUNT_COORDINATOR_USER": getpass.getuser(),
+        "RUN_ROOT": out,
+        "MANIFEST": manifest,
+    }
+    write_env(backend_env, env_values)
+
+    if classic:
+        rc = run_logged(
+            ["bash", str(SCRIPTS / "run_binning_pilot.sh"), str(backend_env)],
+            logs / "binning.classic.log",
+            environment=workflow_environment,
+        )
+        completed_classic = successful_binners(
+            results_root,
+            args.study,
+            args.sample,
+            classic,
+        )
+        if rc != 0:
+            note(
+                "one or more classic binners failed; continuing with "
+                f"available branches: {completed_classic}"
+            )
+
+    taxonomy_provenance: Optional[dict[str, object]] = None
+    vamb_family = tuple(
+        item for item in args.binner_list if item in {"vamb", "taxvamb"}
+    )
+    try:
+        if vamb_family:
+            prepare_vamb_input(
+                preflight,
+                out / "inputs" / "r000001",
+                args.study,
+                args.sample,
+            )
+            taxonomy_root = out / "taxonomy"
+            taxonomy_scope = "single"
+            taxonomy_path = (
+                taxonomy_root
+                / taxonomy_scope
+                / "per_sample"
+                / "r000001.taxonomy.tsv"
+            )
+            if "taxvamb" in vamb_family and args.taxonomy is not None:
+                taxonomy_source, _ = resolve_taxonomy_input(
+                    args.taxonomy,
+                    contigs=args.contigs.resolve(),
+                    sample=args.sample,
+                    minimum_contig_bp=args.min_contig_bp,
+                )
+                normalize_taxonomy(
+                    taxonomy_source,
+                    taxonomy_path,
+                    fasta_lengths(out / "inputs" / "r000001" / "input.fa"),
+                )
+
+            vamb = executable("vamb", "VAMB")
+            version_probe = subprocess.run(
+                [vamb, "--version"],
+                check=False,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                env=workflow_environment,
+            )
+            vamb_identity = (
+                version_probe.stdout.strip().splitlines()[0]
+                if version_probe.stdout.strip()
+                else f"vamb executable {vamb}"
+            )
+            history = config_dir / "vamb.environment.txt"
+            atomic_text(history, vamb_identity + "\n")
+            env_values.update(
+                {
+                    "INPUTS_ROOT": out / "inputs",
+                    "TAXONOMY_ROOT": taxonomy_root,
+                    "OUT_ROOT": results_root,
+                    "ADDON_ROOT": out / "vamb_taxvamb",
+                    "ADDON_STATUS_ROOT": out / "status",
+                    "VAMB_EXE": vamb,
+                    "VAMB_TOOL_IDENTITY": vamb_identity,
+                    "VAMB_ENV_HISTORY": history,
+                    "VAMB_MIN_CONTIG_INCLUSIVE": args.min_contig_bp,
+                    "VAMB_MIN_FASTA_BP": args.retain_min_bin_bp,
+                    "VAMB_TAXVAMB_BINNERS": " ".join(vamb_family),
+                }
+            )
+            write_env(backend_env, env_values)
+
+            if "taxvamb" in vamb_family and args.taxonomy is None:
+                selected_lengths = fasta_lengths(
+                    out / "inputs" / "r000001" / "input.fa"
+                )
+                try:
+                    taxonomy_provenance = run_kunpeng_taxonomy(
+                        args,
+                        source=out / "inputs" / "r000001" / "input.fa",
+                        selected_lengths=selected_lengths,
+                        taxonomy_path=taxonomy_path,
+                        artifact_root=taxonomy_root / "kunpeng",
+                        work=work,
+                        runtime_root=runtime_root,
+                        logs=logs,
+                        environment=workflow_environment,
+                    )
+                except (UserError, OSError, ValueError) as error:
+                    if "vamb" not in vamb_family:
+                        raise
+                    note(f"TaxVAMB taxonomy failed: {error}; continuing with VAMB")
+                    vamb_family = ("vamb",)
+                    env_values["VAMB_TAXVAMB_BINNERS"] = "vamb"
+                    write_env(backend_env, env_values)
+
+            process_env = dict(workflow_environment)
+            process_env["SLURM_ARRAY_TASK_ID"] = "1"
+            socket_runtime_value = environment_value("VAMB_SOCKET_DIR")
+            if socket_runtime_value:
+                socket_runtime = Path(socket_runtime_value).resolve()
+                if (
+                    not socket_runtime.is_dir()
+                    or socket_runtime.parent != Path("/dev/shm")
+                    or not socket_runtime.name.startswith(
+                        ("eukbin-", "eukmag-")
+                    )
+                    or socket_runtime.stat().st_uid != os.getuid()
+                    or len(str(socket_runtime)) >= 80
+                ):
+                    raise UserError(
+                        "EUKBINMINER_VAMB_SOCKET_DIR must be a short, owned "
+                        "/dev/shm/eukbin-* directory (legacy eukmag-* names are "
+                        "also accepted)"
+                    )
+                for name in ("TMPDIR", "TMP", "TEMP"):
+                    process_env[name] = str(socket_runtime)
+            rc = run_logged(
+                [
+                    "bash",
+                    str(SCRIPTS / "run_vamb_taxvamb_array.sh"),
+                    str(backend_env),
+                    taxonomy_scope,
+                ],
+                logs / "binning.vamb_taxvamb.log",
+                environment=process_env,
+            )
+            completed_vamb = successful_binners(
+                results_root,
+                args.study,
+                args.sample,
+                vamb_family,
+            )
+            if rc != 0:
+                note(
+                    "one or more VAMB-family binners failed; continuing with "
+                    f"available branches: {completed_vamb}"
+                )
+    except (UserError, OSError, ValueError) as error:
+        note(f"VAMB-family branch failed: {error}; retaining successful binners")
+
+    completed_binners = successful_binners(
+        results_root,
+        args.study,
+        args.sample,
+        args.binner_list,
+    )
+    if not completed_binners:
+        raise UserError("all requested binners failed or produced no valid branch")
+
+    # Import the validated Python backends only after input/tool preflight.
+    from merge_busco import merge as merge_busco
+    from merge_eukcc import merge as merge_eukcc
+    from select_within_sample_representatives import select as select_representatives
+    from seqkit_bin_stats import build_manifest_index, inventory_sample
+
+    qc_root = out / "qc"
+    seqkit_root = qc_root / "seqkit"
+    seqkit_root.mkdir(parents=True, exist_ok=True)
+    manifest_index = out / "manifest.offsets.bin"
+    build_manifest_index(manifest, manifest_index)
+    seqkit_exe = Path(executable("seqkit", "seqkit"))
+    stats = seqkit_root / "bin_stats.tsv.gz"
+    candidates = seqkit_root / "candidates.tsv"
+    stats_done = seqkit_root / ".complete.json"
+    inventory_sample(
+        manifest=manifest,
+        manifest_index=manifest_index,
+        results_root=results_root,
+        rank=1,
+        binners=completed_binners,
+        seqkit=seqkit_exe,
+        threads=args.threads,
+        minimum_bp=args.qc_min_bin_bp,
+        stats_output=stats,
+        done_output=stats_done,
+        candidate_output=candidates,
+        temporary_root=runtime_directories["TMPDIR"],
+        fail_on_seqkit_error=True,
+    )
+    _, candidate_rows = read_tsv(candidates)
+
+    eukcc_merged = qc_root / "eukcc_merged" / "eukcc_merged.tsv"
+    busco_merged = qc_root / "busco_merged.tsv"
+    env_values.update(
+        {
+            "EUKCC_CANDIDATES": candidates,
+            "BUSCO_CANDIDATES": candidates,
+            "EUKCC_OUT": qc_root / "eukcc",
+            "BUSCO_OUT": qc_root / "busco",
+            "EUKCC_ENV": environment_value("EUKCC_ENV") or "",
+            "BUSCO_ENV": environment_value("BUSCO_ENV") or "",
+            "THREADS": args.threads,
+        }
+    )
+    if "eukcc" in args.qc_list:
+        eukcc_db_value = args.eukcc_db or environment_value("EUKCC_DB")
+        if not eukcc_db_value:
+            raise UserError(
+                "EukCC needs --eukcc-db or EUKBINMINER_EUKCC_DB"
+            )
+        eukcc_db = Path(eukcc_db_value).expanduser().resolve()
+        if not eukcc_db.is_dir():
+            raise UserError(f"EukCC DB is not a directory: {eukcc_db}")
+        env_values["EUKCC_DB"] = eukcc_db
+    if "busco" in args.qc_list:
+        busco_db_value = args.busco_db or environment_value("BUSCO_DB")
+        if not busco_db_value:
+            raise UserError(
+                "BUSCO needs --busco-db or EUKBINMINER_BUSCO_DB"
+            )
+        busco_db = Path(busco_db_value).expanduser().resolve()
+        if not busco_db.is_dir():
+            raise UserError(f"BUSCO DB is not a directory: {busco_db}")
+        env_values["BUSCO_DB"] = busco_db
+    write_env(backend_env, env_values)
+
+    for candidate_rank in range(1, len(candidate_rows) + 1):
+        process_env = dict(workflow_environment)
+        process_env["SLURM_ARRAY_TASK_ID"] = str(candidate_rank)
+        if "eukcc" in args.qc_list:
+            rc = run_logged(
+                [
+                    "bash",
+                    str(SCRIPTS / "run_eukcc_array.sh"),
+                    str(backend_env),
+                    str(candidates),
+                    str(qc_root / "eukcc"),
+                ],
+                logs / f"eukcc.{candidate_rank:06d}.log",
+                environment=process_env,
+            )
+            if rc != 0:
+                raise UserError(
+                    f"EukCC candidate {candidate_rank} failed; see logs"
+                )
+        if "busco" in args.qc_list:
+            rc = run_logged(
+                [
+                    "bash",
+                    str(SCRIPTS / "run_busco_array.sh"),
+                    str(backend_env),
+                    str(candidates),
+                    str(qc_root / "busco"),
+                ],
+                logs / f"busco.{candidate_rank:06d}.log",
+                environment=process_env,
+            )
+            if rc != 0:
+                raise UserError(
+                    f"BUSCO candidate {candidate_rank} failed; see logs"
+                )
+
+    if "eukcc" in args.qc_list:
+        merge_eukcc(candidates, qc_root / "eukcc", qc_root / "eukcc_merged")
+    if "busco" in args.qc_list:
+        merge_busco(candidates, qc_root / "busco", busco_merged)
+
+    decision = qc_root / "decision_qc.tsv"
+    decision_table(args, eukcc_merged, busco_merged, decision)
+    selection = out / "selection"
+    select_representatives(
+        decision,
+        stats_done,
+        selection,
+        args.overlap_threshold,
+        args.contamination_penalty,
+        args.min_completeness,
+        args.max_contamination,
+    )
+    mags_manifest = materialize_representatives(selection, out / "mags")
+
+    summary = {
+        "schema_version": 2,
+        "tool": TOOL_NAME,
+        "version": VERSION,
+        "sample": args.sample,
+        "study": args.study,
+        "requested_binners": list(args.binner_list),
+        "completed_binners": list(completed_binners),
+        "qc_tools": list(args.qc_list),
+        "decision_qc": args.decision_qc,
+        "random_seed": args.random_seed,
+        "taxonomy": input_summary["taxonomy"],
+        "taxonomy_provenance": taxonomy_provenance,
+        "qc_references": input_summary["qc_references"],
+        "discovered_bins": json.loads(stats_done.read_text(encoding="utf-8"))[
+            "discovered_bins"
+        ],
+        "qc_candidates": len(candidate_rows),
+        "representatives": sum(
+            1 for _ in (selection / "representatives.tsv").open()
+        )
+        - 1,
+        "alternatives": sum(
+            1 for _ in (selection / "alternatives.tsv").open()
+        )
+        - 1,
+        "non_redundant_mags": str((out / "mags").resolve()),
+        "mags_manifest_sha256": sha256_file(mags_manifest),
+    }
+    atomic_text(
+        out / "summary.json",
+        json.dumps(summary, indent=2, sort_keys=True) + "\n",
+    )
+    atomic_text(
+        complete,
+        json.dumps(
+            {
+                "run_metadata_sha256": sha256_file(out / "config/run.json"),
+                "summary_sha256": sha256_file(out / "summary.json"),
+                "representatives_sha256": sha256_file(
+                    selection / "representatives.tsv"
+                ),
+                "alternatives_sha256": sha256_file(
+                    selection / "alternatives.tsv"
+                ),
+                "mags_manifest_sha256": sha256_file(mags_manifest),
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+    )
+    note(
+        f"complete: {summary['representatives']} representatives, "
+        f"{summary['alternatives']} alternatives"
+    )
+
+
+def add_workflow_arguments(
+    parser: argparse.ArgumentParser,
+    *,
+    include_decision: bool,
+    include_runtime: bool,
+) -> None:
+    workflow = parser.add_argument_group("workflow selection")
+    workflow.add_argument(
+        "--binners",
+        default="all",
+        metavar="LIST",
+        help=(
+            "all or a comma-separated subset of "
+            "remag,concoct,metabat2,vamb,taxvamb (default: all)"
+        ),
+    )
+    workflow.add_argument(
+        "--qc-tools",
+        default="all",
+        metavar="LIST",
+        help="eukcc, busco, eukcc,busco, or all (default: all)",
+    )
+    if include_decision:
+        workflow.add_argument(
+            "--decision-qc",
+            choices=QC_TOOLS,
+            default="eukcc",
+            help=(
+                "QC tool controlling final eligibility and ordering; it must "
+                "also occur in --qc-tools (default: eukcc)"
+            ),
+        )
+
+    taxvamb = parser.add_argument_group("TaxVAMB")
+    taxonomy_source = taxvamb.add_mutually_exclusive_group()
+    taxonomy_source.add_argument(
+        "--taxonomy",
+        type=Path,
+        metavar="TSV_OR_DIR",
+        help=(
+            "contig taxonomy TSV, or a checksum-bearing reusable taxonomy "
+            "result directory"
+        ),
+    )
+    taxonomy_source.add_argument(
+        "--kunpeng-db",
+        metavar="DIR",
+        help=(
+            "sharded Kun-peng database; defaults to "
+            "EUKBINMINER_KUNPENG_DB when TaxVAMB needs classification"
+        ),
+    )
+
+    references = parser.add_argument_group("reference databases")
+    references.add_argument(
+        "--eukcc-db",
+        metavar="DIR",
+        help="EukCC database; defaults to EUKBINMINER_EUKCC_DB",
+    )
+    references.add_argument(
+        "--busco-db",
+        metavar="DIR",
+        help=(
+            "unpacked BUSCO lineage directory containing dataset.cfg and "
+            "hmms/; defaults to EUKBINMINER_BUSCO_DB"
+        ),
+    )
+
+
+def add_common_arguments(
+    parser: argparse.ArgumentParser,
+    *,
+    include_output: bool,
+) -> None:
+    required = parser.add_argument_group("required arguments")
+    required.add_argument(
+        "--sample",
+        required=True,
+        help="sample ID using letters, digits, dot, underscore, or hyphen",
+    )
+    required.add_argument(
+        "--contigs",
+        required=True,
+        type=Path,
+        metavar="FASTA",
+        help="input contig FASTA with unique record IDs",
+    )
+    required.add_argument(
+        "--depth",
+        required=True,
+        action="append",
+        metavar="[NAME=]TSV",
+        help=(
+            "JGI depth table or generic contig/coverage TSV; repeat for "
+            "independent mapped-sample coverage files, optionally naming a "
+            "single-coverage file as NAME=TSV"
+        ),
+    )
+    if include_output:
+        required.add_argument(
+            "--output",
+            required=True,
+            type=Path,
+            metavar="DIR",
+            help="output directory",
+        )
+
+    add_workflow_arguments(
+        parser,
+        include_decision=True,
+        include_runtime=True,
+    )
+
+    filtering = parser.add_argument_group("input filtering")
+    filtering.add_argument(
+        "--min-contig-bp",
+        type=int,
+        default=1500,
+        metavar="INT",
+        help="minimum contig length entering binning, inclusive (default: 1500)",
+    )
+    filtering.add_argument(
+        "--retain-min-bin-bp",
+        type=int,
+        default=1,
+        metavar="INT",
+        help="minimum raw-bin length to retain (default: 1)",
+    )
+    filtering.add_argument(
+        "--qc-min-bin-bp",
+        type=int,
+        default=500_000,
+        metavar="INT",
+        help="minimum retained-bin length entering QC (default: 500000)",
+    )
+
+    quality = parser.add_argument_group("quality filtering")
+    quality.add_argument(
+        "--min-completeness",
+        type=float,
+        default=50.0,
+        metavar="FLOAT",
+        help="minimum final completeness percentage, inclusive (default: 50)",
+    )
+    quality.add_argument(
+        "--max-contamination",
+        type=float,
+        default=10.0,
+        metavar="FLOAT",
+        help=(
+            "maximum final contamination percentage, inclusive; BUSCO uses "
+            "duplicated percentage as the contamination proxy (default: 10)"
+        ),
+    )
+    quality.add_argument(
+        "--contamination-penalty",
+        type=float,
+        default=5.0,
+        metavar="FLOAT",
+        help=(
+            "penalty in completeness - penalty * contamination "
+            "(default: 5.0)"
+        ),
+    )
+
+    deduplication = parser.add_argument_group("deduplication")
+    deduplication.add_argument(
+        "--overlap-threshold",
+        type=float,
+        default=0.50,
+        metavar="FLOAT",
+        help=(
+            "inclusive shared_contig_bp/min(bin_a_bp,bin_b_bp) threshold "
+            "for cross-binner overlap (default: 0.50)"
+        ),
+    )
+
+    execution = parser.add_argument_group("execution")
+    execution.add_argument(
+        "--threads",
+        type=int,
+        default=4,
+        metavar="INT",
+        help="threads supplied to each external tool (default: 4)",
+    )
+    execution.add_argument(
+        "--random-seed",
+        type=int,
+        default=DEFAULT_RANDOM_SEED,
+        metavar="INT",
+        help=(
+            "positive random seed supplied to seed-aware binners "
+            f"(default: {DEFAULT_RANDOM_SEED})"
+        ),
+    )
+    execution.add_argument(
+        "--study",
+        default="standalone",
+        metavar="NAME",
+        help="study name written to results and metadata (default: standalone)",
+    )
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog=CLI_NAME,
+        description=(
+            "Mine quality-controlled, non-redundant eukaryotic bins from "
+            "contigs and one or more mapped-sample depth tables."
+        ),
+        epilog=(
+            "Auxiliary commands:\n"
+            f"  {CLI_NAME} doctor    check tools and reference databases\n"
+            f"  {CLI_NAME} validate  validate inputs and print the run plan"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("--version", action="version", version=VERSION)
+    add_common_arguments(parser, include_output=True)
+    parser.set_defaults(command="run")
+    return parser
+
+
+def build_doctor_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog=f"{CLI_NAME} doctor",
+        description=(
+            "Check selected executables on PATH and validate reference "
+            "database layout."
+        ),
+    )
+    add_workflow_arguments(
+        parser,
+        include_decision=False,
+        include_runtime=False,
+    )
+    parser.set_defaults(command="doctor")
+    return parser
+
+
+def build_validate_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog=f"{CLI_NAME} validate",
+        description="Validate inputs and print the resolved run plan without running tools.",
+    )
+    add_common_arguments(parser, include_output=False)
+    parser.set_defaults(command="validate")
+    return parser
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    if raw_argv and raw_argv[0] == "doctor":
+        args = build_doctor_parser().parse_args(raw_argv[1:])
+    elif raw_argv and raw_argv[0] == "validate":
+        args = build_validate_parser().parse_args(raw_argv[1:])
+    else:
+        args = build_parser().parse_args(raw_argv)
+    try:
+        if args.command == "doctor":
+            report = doctor_report(args)
+            print(json.dumps(report, indent=2, sort_keys=True))
+            return 0 if report["ok"] else 1
+        validate_args(args)
+        if args.command == "validate":
+            print(json.dumps(validate_inputs(args), indent=2, sort_keys=True))
+        elif args.command == "run":
+            run_workflow(args)
+    except (UserError, OSError, ValueError) as error:
+        print(f"{CLI_NAME}: error: {error}", file=sys.stderr)
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,33 @@
+{% set name = "kun-peng" %}
+{% set version = "0.7.12" %}
+
+package:
+  name: {{ name }}
+  version: {{ version }}
+
+source:
+  url: https://github.com/eric9n/Kun-peng/archive/refs/tags/v{{ version }}.tar.gz
+  sha256: b57996346c3e407b57c407ce0809f97f562b3a51ae993f6e5086dff3ef1f891a
+
+build:
+  number: 0
+
+requirements:
+  build:
+    - {{ compiler("rust") }}
+    - cargo-bundle-licenses
+
+test:
+  commands:
+    - kun_peng --help
+    # Upstream tag v0.7.12 still reports Cargo package version 0.7.11.
+    - kun_peng --version | grep -F "0.7.11"
+
+about:
+  home: https://github.com/eric9n/Kun-peng
+  summary: Low-memory sharded metagenomic taxonomy classifier
+  license: MIT
+  license_file: LICENSE
+  dev_url: https://github.com/eric9n/Kun-peng
+
+# recipe-maintainers are intentionally pending user confirmation.

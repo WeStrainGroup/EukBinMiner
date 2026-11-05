@@ -1,0 +1,15 @@
+cff-version: 1.2.0
+message: "If you use EukBinMiner, please cite this software."
+title: "EukBinMiner"
+type: software
+version: 0.1.1
+date-released: 2026-11-06
+authors:
+  - family-names: "Contributors"
+    given-names: "EukBinMiner"
+abstract: >-
+  A command-line workflow that runs multiple eukaryotic metagenomic binners,
+  evaluates bins with EukCC and/or BUSCO, and selects non-redundant bins using
+  within-sample cross-binner contig overlap.
+repository-code: "https://github.com/WeStrainGroup/EukBinMiner"
+license: CC-BY-NC-SA-4.0

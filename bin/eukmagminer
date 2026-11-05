@@ -1,0 +1,33 @@
+#!/usr/bin/env python3
+"""Deprecated compatibility launcher for EukBinMiner."""
+
+from __future__ import annotations
+
+import os
+import sys
+from pathlib import Path
+
+
+def main() -> int:
+    target = Path(__file__).with_name("eukbinminer")
+    if not target.is_file():
+        print(
+            "eukmagminer: compatibility launcher cannot find eukbinminer",
+            file=sys.stderr,
+        )
+        return 127
+    print(
+        "[EukBinMiner] warning: 'eukmagminer' is a deprecated compatibility "
+        "alias; use 'eukbinminer'",
+        file=sys.stderr,
+        flush=True,
+    )
+    os.execv(
+        sys.executable,
+        [sys.executable, str(target), *sys.argv[1:]],
+    )
+    return 127
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

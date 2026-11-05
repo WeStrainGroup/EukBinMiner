@@ -1,0 +1,7 @@
+name: eukbin-concoct
+channels:
+  - conda-forge
+  - bioconda
+dependencies:
+  - concoct=1.1.0
+  - biopython
