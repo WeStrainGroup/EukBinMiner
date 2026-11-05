@@ -247,3 +247,32 @@ class ReviewRegressionTests(unittest.TestCase):
         self.assertEqual(cli.successful_binners(results, "standalone", "sample1", ("metabat2",)), ())
         status.write_text("input_set\tbinner\tstatus\texit_code\nunion\tmetabat2\tcompleted\t0\n")
         self.assertEqual(cli.successful_binners(results, "standalone", "sample1", ("metabat2",)), ("metabat2",))
+
+    def test_eukcc_failure_statuses_are_explicit(self):
+        tool = self.tools / "eukcc"
+        original = tool.read_text()
+        for status, message in (
+            ("no_placement_markers", "No placement marker genes found"),
+            ("no_suitable_marker_set", "No marker gene set could be found"),
+            ("placement_alignment_failed", "Found 1 marker genes, placing them in the tree using epa-ng"),
+            ("fatal", "Unexpected external-tool failure"),
+        ):
+            with self.subTest(status=status):
+                replacement = (
+                    f"        (out / 'run.log').write_text({message!r})\n"
+                    "        (out / 'hmmalign.stdout').touch()\n"
+                    "        raise SystemExit(1)\n"
+                    "        bin_path = args[-1]"
+                )
+                tool.write_text(original.replace("        bin_path = args[-1]", replacement))
+                output = self.root / status
+                result = self.run_cli(*self.arguments(output))
+                if status == "fatal":
+                    self.assertEqual(result.returncode, 2)
+                    self.assertFalse((output / ".complete.json").exists())
+                    continue
+                self.assertEqual(result.returncode, 0, result.stderr)
+                with (output / "qc/decision_qc.tsv").open() as handle:
+                    row = next(csv.DictReader(handle, delimiter="\t"))
+                self.assertEqual(row["eukcc_status"], status)
+                self.assertEqual(row["qc_pass"], "no")

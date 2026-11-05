@@ -39,7 +39,7 @@ process_candidate() {
     local row
     local bin_rank bin_id study sample sample_rank binner original_bin_id
     local contigs bp n50 longest sha256 source_path bin_path materialization
-    local final_dir stage rc failed
+    local final_dir stage rc failed status message
 
     row="$(
         awk -F '\t' -v rank="$candidate_rank" '
@@ -106,68 +106,26 @@ process_candidate() {
     rc=$?
     set -e
     if ((rc != 0)); then
+        # Require the known log/artifact evidence before recording unassessed QC.
         if grep -FRq 'No placement marker genes found' "$stage"; then
-            printf 'eukcc_status\texit_code\tmessage\n' > "${stage}/status.tsv"
-            printf 'no_placement_markers\t%s\t%s\n' \
-                "$rc" \
-                'EukCC found no placement marker genes' >> "${stage}/status.tsv"
-            printf '%s\t%s\t%s\n' \
-                "$bin_id" "$sha256" "$bin_path" > "${stage}/input.tsv"
-            touch "${stage}/.done"
-            mv "$stage" "$final_dir"
-            printf '[WARN] EukCC found no placement markers for %s; recorded valid status\n' \
-                "$bin_id" >&2
-            return 0
-        fi
-        if grep -FRq \
+            status=no_placement_markers
+            message='EukCC found no placement marker genes'
+        elif grep -FRq \
             -e 'No marker gene set could be found' \
             -e 'Could not identify a single suitable marker gene set' \
             "$stage"; then
-            printf 'eukcc_status\texit_code\tmessage\n' > "${stage}/status.tsv"
-            printf 'no_suitable_marker_set\t%s\t%s\n' \
-                "$rc" \
-                'EukCC could not identify a suitable marker gene set' \
-                >> "${stage}/status.tsv"
-            printf '%s\t%s\t%s\n' \
-                "$bin_id" "$sha256" "$bin_path" > "${stage}/input.tsv"
-            touch "${stage}/.done"
-            mv "$stage" "$final_dir"
-            printf '[WARN] EukCC found no suitable marker set for %s; recorded valid status\n' \
-                "$bin_id" >&2
-            return 0
-        fi
-        # EukCC 2.1.2 can deterministically finish MetaEuk without any
-        # predicted proteins.  Such a bin has no defensible EukCC quality
-        # estimate; preserve it as explicitly unassessed instead of inventing
-        # completeness/contamination values or failing the whole sample.
-        # Normalize only the exact log plus zero-length protein/codon outputs,
-        # with no quality CSV, so unrelated MetaEuk failures remain fatal.
-        if grep -FRq 'Metaeuk produced empty fasta.' "$stage" &&
+            status=no_suitable_marker_set
+            message='EukCC could not identify a suitable marker gene set'
+        elif grep -FRq 'Metaeuk produced empty fasta.' "$stage" &&
             find "$stage" -type f -name '*_metaeuk_cleaned.faa' -size 0c \
                 -print -quit | grep -q . &&
             find "$stage" -type f -name '*_metaeuk.codon.fas' -size 0c \
                 -print -quit | grep -q . &&
             ! find "$stage" -type f -name '*.csv' -size +0c -print -quit |
                 grep -q .; then
-            printf 'eukcc_status\texit_code\tmessage\n' > "${stage}/status.tsv"
-            printf 'metaeuk_empty_proteins\t%s\t%s\n' \
-                "$rc" \
-                'EukCC MetaEuk produced no proteins; quality is unassessable' \
-                >> "${stage}/status.tsv"
-            printf '%s\t%s\t%s\n' \
-                "$bin_id" "$sha256" "$bin_path" > "${stage}/input.tsv"
-            touch "${stage}/.done"
-            mv "$stage" "$final_dir"
-            printf '[WARN] EukCC MetaEuk produced no proteins for %s; recorded valid unassessed status\n' \
-                "$bin_id" >&2
-            return 0
-        fi
-        # EukCC 2.1.2 can exit during hmmalign when exactly one base
-        # placement marker is found.  This is deterministic for the affected
-        # bin and produces neither an EPA query nor a quality estimate.  Only
-        # normalize that narrow filesystem/log signature; later EPA failures,
-        # OOMs, and every other non-zero exit remain fatal.
-        if grep -FRq \
+            status=metaeuk_empty_proteins
+            message='EukCC MetaEuk produced no proteins; quality is unassessable'
+        elif grep -FRq \
             'Found 1 marker genes, placing them in the tree using epa-ng' \
             "$stage" &&
             find "$stage" -type f -name 'hmmalign.stdout' -size 0c \
@@ -176,26 +134,19 @@ process_candidate() {
                 grep -q . &&
             ! find "$stage" -type f -name 'epa-ng.stout' -print -quit |
                 grep -q .; then
-            printf 'eukcc_status\texit_code\tmessage\n' > "${stage}/status.tsv"
-            printf 'placement_alignment_failed\t%s\t%s\n' \
-                "$rc" \
-                'EukCC single-marker placement alignment failed; quality is unassessable' \
-                >> "${stage}/status.tsv"
-            printf '%s\t%s\t%s\n' \
-                "$bin_id" "$sha256" "$bin_path" > "${stage}/input.tsv"
-            touch "${stage}/.done"
-            mv "$stage" "$final_dir"
-            printf '[WARN] EukCC single-marker placement alignment failed for %s; recorded valid unassessed status\n' \
-                "$bin_id" >&2
-            return 0
+            status=placement_alignment_failed
+            message='EukCC single-marker placement alignment failed; quality is unassessable'
+        else
+            failed="${EUKCC_OUT}/failed.${bin_id}.$(date -u '+%Y%m%dT%H%M%SZ').$$"
+            mv "$stage" "$failed"
+            printf '[ERROR] EukCC failed for %s (exit %s); retained %s\n' \
+                "$bin_id" "$rc" "$failed" >&2
+            return "$rc"
         fi
-        failed="${EUKCC_OUT}/failed.${bin_id}.$(date -u '+%Y%m%dT%H%M%SZ').$$"
-        mv "$stage" "$failed"
-        printf '[ERROR] EukCC failed for %s (exit %s); retained %s\n' \
-            "$bin_id" "$rc" "$failed" >&2
-        return "$rc"
-    fi
-    if ! find "$stage" -type f -name '*.csv' -size +0c -print -quit |
+        printf 'eukcc_status\texit_code\tmessage\n' > "${stage}/status.tsv"
+        printf '%s\t%s\t%s\n' "$status" "$rc" "$message" >> "${stage}/status.tsv"
+        printf '[WARN] %s for %s\n' "$message" "$bin_id" >&2
+    elif ! find "$stage" -type f -name '*.csv' -size +0c -print -quit |
         grep -q .; then
         failed="${EUKCC_OUT}/failed.${bin_id}.$(date -u '+%Y%m%dT%H%M%SZ').$$"
         mv "$stage" "$failed"

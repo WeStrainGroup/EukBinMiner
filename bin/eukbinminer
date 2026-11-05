@@ -1472,9 +1472,6 @@ def validate_inputs(args: argparse.Namespace) -> dict[str, object]:
         "retain_min_bin_bp": args.retain_min_bin_bp,
         "qc_min_bin_bp": args.qc_min_bin_bp,
         "min_contig_bp": args.min_contig_bp,
-        "min_completeness": args.min_completeness,
-        "max_contamination": args.max_contamination,
-        "contamination_penalty": args.contamination_penalty,
         "overlap_threshold": args.overlap_threshold,
     }
 
@@ -1944,7 +1941,6 @@ def verify_complete_output(out: Path) -> None:
 
 
 def run_locked_workflow(args: argparse.Namespace) -> None:
-    validate_args(args)
     input_summary = validate_inputs(args)
     out = args.output.resolve()
     complete = out / ".complete.json"
@@ -2037,7 +2033,6 @@ def run_locked_workflow(args: argparse.Namespace) -> None:
     preflight = results_root / args.study / args.sample / "preflight"
     normalized_depth = work / "input" / "depth.jgi.tsv"
     normalized_depth.parent.mkdir(parents=True, exist_ok=True)
-    depth_inputs = parse_depth_inputs(args.depth)
     depth_text, _ = normalized_depth_inputs(
         depth_inputs,
         fasta_lengths(args.contigs.resolve(), allow_empty=True),
