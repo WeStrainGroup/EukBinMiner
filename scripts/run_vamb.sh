@@ -3,8 +3,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 0007
 
-GLOBAL_CONFIG="${1:?Usage: run_vamb_taxvamb_array.sh GLOBAL_CONFIG TAXONOMY_SCOPE}"
-REQUESTED_SCOPE="${2:?Usage: run_vamb_taxvamb_array.sh GLOBAL_CONFIG TAXONOMY_SCOPE}"
+GLOBAL_CONFIG="${1:?Usage: run_vamb.sh GLOBAL_CONFIG}"
 [[ -s "$GLOBAL_CONFIG" ]] || {
     printf '[ERROR] Config not found: %s\n' "$GLOBAL_CONFIG" >&2
     exit 2
@@ -15,7 +14,6 @@ source "$GLOBAL_CONFIG"
 : "${MANIFEST:?Missing MANIFEST}"
 : "${PIPELINE_DIR:?Missing PIPELINE_DIR}"
 : "${INPUTS_ROOT:?Missing INPUTS_ROOT}"
-: "${TAXONOMY_ROOT:?Missing TAXONOMY_ROOT}"
 : "${OUT_ROOT:?Missing OUT_ROOT}"
 : "${ADDON_ROOT:?Missing ADDON_ROOT}"
 : "${ADDON_STATUS_ROOT:?Missing ADDON_STATUS_ROOT}"
@@ -26,19 +24,12 @@ source "$GLOBAL_CONFIG"
 : "${VAMB_MIN_CONTIG_INCLUSIVE:=1500}"
 : "${VAMB_MIN_FASTA_BP:=1}"
 : "${RANDOM_SEED:=6311}"
-: "${VAMB_TAXVAMB_BINNERS:=vamb taxvamb}"
 : "${THREADS:=${SLURM_CPUS_PER_TASK:-8}}"
 : "${SLURM_ARRAY_TASK_ID:?Missing SLURM_ARRAY_TASK_ID}"
 
 [[ "$RANDOM_SEED" =~ ^[1-9][0-9]*$ ]] || {
     printf '[ERROR] RANDOM_SEED must be a positive integer: %s\n' \
         "$RANDOM_SEED" >&2
-    exit 2
-}
-
-TAXONOMY_SCOPE="$REQUESTED_SCOPE"
-[[ "$TAXONOMY_SCOPE" =~ ^[A-Za-z0-9._-]+$ ]] || {
-    printf '[ERROR] Unsafe taxonomy scope: %s\n' "$TAXONOMY_SCOPE" >&2
     exit 2
 }
 
@@ -73,12 +64,7 @@ input_dir="${INPUTS_ROOT}/${rank_name}"
 input_fasta="${input_dir}/input.fa"
 abundance="${input_dir}/abundance.tsv"
 input_metadata="${input_dir}/input.json"
-taxonomy="${TAXONOMY_ROOT}/${TAXONOMY_SCOPE}/per_sample/${rank_name}.taxonomy.tsv"
-required_paths=("$input_fasta" "$abundance" "$input_metadata")
-if [[ " ${VAMB_TAXVAMB_BINNERS} " == *" taxvamb "* ]]; then
-    required_paths+=("$taxonomy")
-fi
-for path in "${required_paths[@]}"; do
+for path in "$input_fasta" "$abundance" "$input_metadata"; do
     [[ -f "$path" ]] || {
         printf '[ERROR] Required input not found: %s\n' "$path" >&2
         exit 2
@@ -143,19 +129,13 @@ write_fingerprint() {
         --file "input_fasta=${input_fasta}"
         --file "abundance=${abundance}"
         --file "input_metadata=${input_metadata}"
-        --file "runner=${PIPELINE_DIR}/scripts/run_vamb_taxvamb_array.sh"
+        --file "runner=${PIPELINE_DIR}/scripts/run_vamb.sh"
         --file "auditor=${PIPELINE_DIR}/scripts/audit_branch.py"
-        --file "environment_spec=${PIPELINE_DIR}/envs/vamb_taxvamb.yml"
+        --file "environment_spec=${PIPELINE_DIR}/envs/vamb.yml"
         --file "environment_history=${VAMB_ENV_HISTORY}"
         --file "vamb_executable=${VAMB_EXE}"
         --file "vamb_seed_launcher=${PIPELINE_DIR}/scripts/run_seeded_vamb.py"
     )
-    if [[ "$binner" == "taxvamb" ]]; then
-        args+=(
-            --field "taxometer_refinement=enabled"
-            --file "taxonomy=${taxonomy}"
-        )
-    fi
     args+=(--output "$output")
     "$PYTHON_EXE" "${PIPELINE_DIR}/scripts/branch_fingerprint.py" \
         "${args[@]}"
@@ -279,12 +259,8 @@ run_branch() {
             --
             "$VAMB_EXE"
             bin
+            default
         )
-        if [[ "$binner" == "vamb" ]]; then
-            command+=(default)
-        else
-            command+=(taxvamb --taxonomy "$taxonomy")
-        fi
         command+=(
             --outdir "$tool_out"
             --fasta "$input_fasta"
@@ -350,41 +326,10 @@ run_branch() {
     printf '%s completed: %s\n' "$binner" "$final_dir"
 }
 
-vamb_status="not_requested"
-taxvamb_status="not_requested"
-overall_status=0
-IFS=' ' read -r -a requested_binners <<< "$VAMB_TAXVAMB_BINNERS"
-((${#requested_binners[@]} > 0)) || {
-    printf '[ERROR] VAMB_TAXVAMB_BINNERS is empty\n' >&2
-    exit 2
-}
-for requested_binner in "${requested_binners[@]}"; do
-    case "$requested_binner" in
-        vamb)
-            set +e
-            (set -Eeuo pipefail; run_branch vamb)
-            vamb_status="$?"
-            set -e
-            if ((vamb_status != 0)); then
-                overall_status=1
-            fi
-            ;;
-        taxvamb)
-            set +e
-            (set -Eeuo pipefail; run_branch taxvamb)
-            taxvamb_status="$?"
-            set -e
-            if ((taxvamb_status != 0)); then
-                overall_status=1
-            fi
-            ;;
-        *)
-            printf '[ERROR] Unsupported VAMB_TAXVAMB_BINNERS entry: %s\n' \
-                "$requested_binner" >&2
-            exit 2
-            ;;
-    esac
-done
+set +e
+(set -Eeuo pipefail; run_branch vamb)
+vamb_status="$?"
+set -e
 
 status_path="${status_dir}/${rank_name}.status.tsv"
 status_stage="$(
@@ -395,16 +340,14 @@ status_stage="$(
     printf 'rank\t%s\n' "$rank"
     printf 'study\t%s\n' "$study"
     printf 'sample\t%s\n' "$sample"
-    printf 'taxonomy_scope\t%s\n' "$TAXONOMY_SCOPE"
     printf 'contigs\t%s\n' "$contig_count"
     printf 'vamb_status\t%s\n' "$vamb_status"
-    printf 'taxvamb_status\t%s\n' "$taxvamb_status"
     printf 'completed_utc\t%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 } > "$status_stage"
 tighten_owned_permissions "$status_stage"
 mv -f -- "$status_stage" "$status_path"
 
-if ((overall_status == 0)); then
+if ((vamb_status == 0)); then
     done_path="${status_dir}/${rank_name}.done"
     done_stage="$(
         mktemp "${status_dir}/.${rank_name}.done.${SLURM_JOB_ID:-manual}.XXXXXX"

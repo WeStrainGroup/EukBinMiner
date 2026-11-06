@@ -76,14 +76,6 @@ class HpcTemporaryStorageSafetyTests(unittest.TestCase):
         self.assertEqual(unsafe, [])
 
 
-    def test_taxvamb_environment_uses_kunpeng_not_kraken(self) -> None:
-        environment = (
-            PROJECT / "envs" / "vamb_taxvamb.yml"
-        ).read_text(
-            encoding="utf-8"
-        )
-        self.assertIn("kun-peng=0.7.12", environment)
-        self.assertNotIn("kraken2=", environment)
 
 
 if __name__ == "__main__":

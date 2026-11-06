@@ -11,7 +11,6 @@ dependencies:
   - biopython
   - metabat2=2.18_23_gc869c52
   - vamb=5.0.4
-  - kun-peng=0.7.12
   - seqkit
   - eukcc=2.1.3
   - taxonkit

@@ -15,7 +15,6 @@ import os
 import re
 import shlex
 import shutil
-import struct
 import subprocess
 import sys
 import tempfile
@@ -25,17 +24,12 @@ from pathlib import Path
 from typing import IO, Iterable, Optional, Sequence
 
 
-VERSION = "0.1.1"
+VERSION = "0.1.2"
 TOOL_NAME = "EukBinMiner"
 CLI_NAME = "eukbinminer"
-BINNERS = ("remag", "concoct", "metabat2", "vamb", "taxvamb")
+BINNERS = ("remag", "concoct", "metabat2", "vamb")
 QC_TOOLS = ("eukcc", "busco")
 DEFAULT_RANDOM_SEED = 6311
-KUNPENG_RELEASE_TAG = "v0.7.12"
-KUNPENG_RELEASE_COMMIT = "b3ace5c3b9af41eb453a89b5e038400c15917793"
-KUNPENG_HPC_BINARY_SHA256 = (
-    "648905c20bc1c4e298a6f8c54108762b642978deee2f737484a2e324eac2852e"
-)
 INSTALL_ROOT = Path(__file__).resolve().parents[1]
 _script_candidates = (
     INSTALL_ROOT / "scripts",
@@ -504,138 +498,6 @@ def normalized_depth_text(
     )
 
 
-def normalize_taxonomy(
-    source: Path,
-    destination: Optional[Path],
-    contig_lengths: OrderedDict[str, int],
-) -> None:
-    if not source.is_file() or source.stat().st_size == 0:
-        raise UserError(f"taxonomy table does not exist or is empty: {source}")
-    with open_text(source) as handle:
-        header = handle.readline().rstrip("\r\n").split("\t")
-        if len(header) < 2:
-            raise UserError(f"taxonomy table requires two columns: {source}")
-        id_index = next(
-            (
-                header.index(name)
-                for name in (
-                    "contigs",
-                    "contig_id",
-                    "contigName",
-                    "contigname",
-                )
-                if name in header
-            ),
-            0,
-        )
-        taxonomy_index = next(
-            (
-                header.index(name)
-                for name in ("predictions", "taxonomy", "lineage")
-                if name in header
-            ),
-            1,
-        )
-        observed: dict[str, str] = {}
-        for line_number, raw_line in enumerate(handle, start=2):
-            fields = raw_line.rstrip("\r\n").split("\t")
-            if max(id_index, taxonomy_index) >= len(fields):
-                raise UserError(
-                    f"{source}: malformed taxonomy row at line {line_number}"
-                )
-            identifier = fields[id_index]
-            if identifier not in contig_lengths:
-                continue
-            if identifier in observed:
-                raise UserError(
-                    f"{source}: duplicate taxonomy for {identifier!r}"
-                )
-            observed[identifier] = fields[taxonomy_index]
-    missing = [
-        identifier for identifier in contig_lengths if identifier not in observed
-    ]
-    if missing:
-        raise UserError(
-            f"{len(missing)} FASTA contigs lack taxonomy rows; "
-            f"examples={missing[:10]}"
-        )
-    content = "contigs\tpredictions\n" + "".join(
-        f"{identifier}\t{observed[identifier]}\n"
-        for identifier in contig_lengths
-    )
-    if destination is not None:
-        atomic_text(destination, content)
-
-
-def resolve_taxonomy_input(
-    source: Path,
-    *,
-    contigs: Optional[Path] = None,
-    sample: Optional[str] = None,
-    minimum_contig_bp: Optional[int] = None,
-) -> tuple[Path, str]:
-    """Resolve a plain TSV or a checksum-bearing taxonomy result directory."""
-
-    resolved = source.expanduser().resolve()
-    if not resolved.is_dir():
-        return resolved, "table"
-
-    taxonomy = resolved / "taxonomy.tsv"
-    summary_path = resolved / "summary.json"
-    complete_path = resolved / ".complete.json"
-    missing = [
-        path.name
-        for path in (taxonomy, summary_path, complete_path)
-        if not path.is_file()
-    ]
-    if missing:
-        raise UserError(
-            f"taxonomy result directory is incomplete: {resolved}; "
-            f"missing={missing}"
-        )
-    try:
-        summary = json.loads(summary_path.read_text(encoding="utf-8"))
-        complete = json.loads(complete_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as error:
-        raise UserError(
-            f"cannot read taxonomy result metadata in {resolved}: {error}"
-        ) from error
-
-    taxonomy_sha256 = sha256_file(taxonomy)
-    summary_sha256 = sha256_file(summary_path)
-    if (
-        summary.get("command") != "taxonomy"
-        or summary.get("taxonomy_sha256") != taxonomy_sha256
-        or complete.get("taxonomy_sha256") != taxonomy_sha256
-        or complete.get("summary_sha256") != summary_sha256
-    ):
-        raise UserError(
-            f"taxonomy result checksum or command metadata is invalid: {resolved}"
-        )
-    if contigs is not None:
-        contigs_sha256 = sha256_file(contigs.expanduser().resolve())
-        if summary.get("contigs_sha256") != contigs_sha256:
-            raise UserError(
-                "taxonomy result was created from different contigs: "
-                f"{resolved}"
-            )
-    if sample is not None and summary.get("sample") != sample:
-        raise UserError(
-            f"taxonomy result sample is {summary.get('sample')!r}, "
-            f"not {sample!r}: {resolved}"
-        )
-    if (
-        minimum_contig_bp is not None
-        and summary.get("minimum_contig_bp") != minimum_contig_bp
-    ):
-        raise UserError(
-            "taxonomy result uses a different --min-contig-bp "
-            f"({summary.get('minimum_contig_bp')!r} instead of "
-            f"{minimum_contig_bp}): {resolved}"
-        )
-    return taxonomy, "result_directory"
-
-
 def parse_choices(
     value: str,
     supported: Sequence[str],
@@ -683,139 +545,6 @@ def directory_state(path: Optional[Path], required: Sequence[str]) -> dict[str, 
     }
 
 
-def kunpeng_database_state(path: Optional[Path]) -> dict[str, object]:
-    """Validate a Kun-peng sharded database without reading every shard."""
-
-    if path is None:
-        return {"ok": False, "path": None, "error": "not configured"}
-    resolved = path.expanduser().resolve()
-    required = ("hash_config.k2d", "opts.k2d", "taxo.k2d")
-    missing = [
-        name
-        for name in required
-        if not (resolved / name).is_file()
-        or (resolved / name).stat().st_size == 0
-    ]
-    state: dict[str, object] = {
-        "ok": False,
-        "path": str(resolved),
-        "missing": missing,
-        "error": "directory missing or incomplete",
-    }
-    if not resolved.is_dir() or missing:
-        return state
-
-    config_path = resolved / "hash_config.k2d"
-    try:
-        config = config_path.read_bytes()
-        if len(config) != 48:
-            raise ValueError(
-                f"hash_config.k2d must be 48 bytes, observed {len(config)}"
-            )
-        (
-            version,
-            partition,
-            hash_capacity,
-            capacity,
-            size,
-            value_bits,
-        ) = struct.unpack("<6Q", config)
-        if (
-            partition < 1
-            or hash_capacity < 1
-            or capacity < 1
-            or size > capacity
-            or not 1 <= value_bits <= 63
-        ):
-            raise ValueError("hash_config.k2d contains invalid values")
-
-        expected_names = {
-            f"hash_{index}.k2d" for index in range(1, partition + 1)
-        }
-        observed_paths = sorted(
-            item
-            for item in resolved.glob("hash_*.k2d")
-            if re.fullmatch(r"hash_[1-9][0-9]*\.k2d", item.name)
-        )
-        observed_names = {item.name for item in observed_paths}
-        if observed_names != expected_names:
-            missing_shards = sorted(expected_names - observed_names)
-            extra_shards = sorted(observed_names - expected_names)
-            raise ValueError(
-                "shard set does not match hash_config.k2d: "
-                f"missing={missing_shards[:10]}, extra={extra_shards[:10]}"
-            )
-
-        shard_capacity_sum = 0
-        shard_bytes = 0
-        for index in range(1, partition + 1):
-            shard = resolved / f"hash_{index}.k2d"
-            with shard.open("rb") as handle:
-                header = handle.read(16)
-            if len(header) != 16:
-                raise ValueError(f"short shard header: {shard}")
-            observed_index, observed_capacity = struct.unpack("<2Q", header)
-            expected_size = 16 + observed_capacity * 4
-            if observed_index != index:
-                raise ValueError(
-                    f"{shard.name}: header index {observed_index} != {index}"
-                )
-            if not 1 <= observed_capacity <= hash_capacity:
-                raise ValueError(
-                    f"{shard.name}: invalid shard capacity {observed_capacity}"
-                )
-            if shard.stat().st_size != expected_size:
-                raise ValueError(
-                    f"{shard.name}: size {shard.stat().st_size} != "
-                    f"{expected_size}"
-                )
-            shard_capacity_sum += observed_capacity
-            shard_bytes += expected_size
-        if shard_capacity_sum != capacity:
-            raise ValueError(
-                f"shard capacity sum {shard_capacity_sum} != {capacity}"
-            )
-    except (OSError, ValueError, struct.error) as error:
-        state["error"] = str(error)
-        return state
-
-    metadata_path = next(
-        (
-            candidate
-            for candidate in (
-                resolved / "eukbinminer-kunpeng-db.json",
-                resolved / "eukmagminer-kunpeng-db.json",
-            )
-            if candidate.is_file()
-        ),
-        resolved / "eukbinminer-kunpeng-db.json",
-    )
-    metadata: Optional[dict[str, object]] = None
-    if metadata_path.is_file():
-        try:
-            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as error:
-            state["error"] = f"invalid database metadata: {error}"
-            return state
-
-    state.update(
-        {
-            "ok": True,
-            "error": "",
-            "version": version,
-            "partitions": partition,
-            "hash_capacity": hash_capacity,
-            "capacity": capacity,
-            "size": size,
-            "value_bits": value_bits,
-            "shard_bytes": shard_bytes,
-            "shard_gib": round(shard_bytes / (1024**3), 3),
-            "metadata": metadata,
-        }
-    )
-    return state
-
-
 def doctor_report(args: argparse.Namespace) -> dict[str, object]:
     binners = parse_choices(args.binners, BINNERS, "binners")
     qc_tools = parse_choices(args.qc_tools, QC_TOOLS, "QC tools")
@@ -846,13 +575,7 @@ def doctor_report(args: argparse.Namespace) -> dict[str, object]:
     add_executable("bash", "bash")
     add_executable("seqkit", "seqkit")
     for tool in (*binners, *qc_tools):
-        if tool in {"vamb", "taxvamb"}:
-            continue
         add_executable(tool, tool)
-    if any(item in binners for item in ("vamb", "taxvamb")):
-        add_executable("vamb", "vamb")
-    if "taxvamb" in binners and args.taxonomy is None:
-        add_executable("Kun-peng", "kun_peng")
 
     databases: dict[str, dict[str, object]] = {}
     if "eukcc" in qc_tools:
@@ -867,24 +590,6 @@ def doctor_report(args: argparse.Namespace) -> dict[str, object]:
             Path(value) if value else None,
             ("dataset.cfg", "hmms"),
         )
-    if "taxvamb" in binners:
-        if args.taxonomy is not None:
-            taxonomy, taxonomy_kind = resolve_taxonomy_input(args.taxonomy)
-            databases["taxonomy"] = {
-                "ok": taxonomy.is_file() and taxonomy.stat().st_size > 0,
-                "path": str(taxonomy),
-                "input_kind": taxonomy_kind,
-                "error": (
-                    ""
-                    if taxonomy.is_file() and taxonomy.stat().st_size > 0
-                    else "file missing or empty"
-                ),
-            }
-        else:
-            value = args.kunpeng_db or environment_value("KUNPENG_DB")
-            databases["kunpeng"] = kunpeng_database_state(
-                Path(value) if value else None
-            )
     ok = all(bool(check["ok"]) for check in checks) and all(
         bool(database["ok"]) for database in databases.values()
     )
@@ -1017,7 +722,7 @@ def prepare_vamb_input(
         if not kept_indices:
             raise UserError(
                 "all prepared coverage columns are zero; refusing to invent "
-                "an abundance dimension for VAMB/TaxVAMB"
+                "an abundance dimension for VAMB"
             )
         original_coverage_columns = coverage_columns
         coverage_columns = [
@@ -1113,10 +818,8 @@ def successful_binners(
     if vamb_status.is_file():
         _, rows = read_tsv(vamb_status)
         states = {row["field"]: row["value"] for row in rows}
-        successful.update(
-            binner for binner in ("vamb", "taxvamb")
-            if states.get(f"{binner}_status") == "0"
-        )
+        if states.get("vamb_status") == "0":
+            successful.add("vamb")
     return tuple(
         binner for binner in requested
         if binner in successful
@@ -1334,15 +1037,6 @@ def validate_args(args: argparse.Namespace) -> None:
         raise UserError("--random-seed must be positive and at most 4294967295")
     if args.min_contig_bp < 1:
         raise UserError("--min-contig-bp must be positive")
-    if args.taxonomy is not None and args.kunpeng_db is not None:
-        raise UserError("--taxonomy and --kunpeng-db are mutually exclusive")
-    if "taxvamb" not in args.binner_list and (
-        args.taxonomy is not None or args.kunpeng_db is not None
-    ):
-        raise UserError(
-            "--taxonomy and --kunpeng-db are only meaningful when taxvamb "
-            "is selected"
-        )
     if args.sample in {".", ".."} or not re.fullmatch(r"[A-Za-z0-9._-]+", args.sample):
         raise UserError(
             "--sample must contain only letters, digits, dot, underscore, hyphen"
@@ -1367,41 +1061,6 @@ def validate_inputs(args: argparse.Namespace) -> dict[str, object]:
         lengths,
         args.sample,
     )
-    taxonomy_state = "not_requested"
-    if "taxvamb" in args.binner_list:
-        if args.taxonomy is not None:
-            taxonomy_path, taxonomy_kind = resolve_taxonomy_input(
-                args.taxonomy,
-                contigs=contigs,
-                sample=args.sample,
-                minimum_contig_bp=args.min_contig_bp,
-            )
-            normalize_taxonomy(
-                taxonomy_path,
-                None,
-                eligible_lengths,
-            )
-            taxonomy_state = (
-                "reusable_result"
-                if taxonomy_kind == "result_directory"
-                else "provided_table"
-            )
-        else:
-            kunpeng_db_value = args.kunpeng_db or environment_value(
-                "KUNPENG_DB"
-            )
-            if not kunpeng_db_value:
-                raise UserError(
-                    "taxvamb needs --taxonomy, --kunpeng-db, or "
-                    "EUKBINMINER_KUNPENG_DB"
-                )
-            kunpeng_state = kunpeng_database_state(Path(kunpeng_db_value))
-            if not kunpeng_state["ok"]:
-                raise UserError(
-                    "Kun-peng database is incomplete or invalid: "
-                    f"{kunpeng_state['path']}: {kunpeng_state['error']}"
-                )
-            taxonomy_state = "kunpeng"
     eukcc_db_value = args.eukcc_db or environment_value("EUKCC_DB")
     busco_db_value = args.busco_db or environment_value("BUSCO_DB")
     if "eukcc" in args.qc_list:
@@ -1468,287 +1127,11 @@ def validate_inputs(args: argparse.Namespace) -> dict[str, object]:
         "max_contamination": args.max_contamination,
         "contamination_penalty": args.contamination_penalty,
         "qc_references": qc_references,
-        "taxonomy": taxonomy_state,
         "retain_min_bin_bp": args.retain_min_bin_bp,
         "qc_min_bin_bp": args.qc_min_bin_bp,
         "min_contig_bp": args.min_contig_bp,
         "overlap_threshold": args.overlap_threshold,
     }
-
-
-def write_classifier_catalogue(
-    source: Path,
-    destination: Path,
-    selected_lengths: OrderedDict[str, int],
-) -> None:
-    """Write selected contigs with the rank prefix used by classifiers."""
-
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    identifier: Optional[str] = None
-    sequence: list[str] = []
-
-    def finish(handle: IO[str]) -> None:
-        if identifier is None or identifier not in selected_lengths:
-            return
-        observed = "".join(sequence)
-        if len(observed) != selected_lengths[identifier]:
-            raise UserError(
-                f"{source}: sequence length changed while preparing {identifier!r}"
-            )
-        handle.write(f">r000001C{identifier}\n")
-        for start in range(0, len(observed), 80):
-            handle.write(observed[start : start + 80] + "\n")
-
-    with open_text(source) as input_handle, destination.open(
-        "wt", encoding="utf-8", newline="\n"
-    ) as output_handle:
-        for raw_line in input_handle:
-            line = raw_line.rstrip("\r\n")
-            if line.startswith(">"):
-                finish(output_handle)
-                identifier = line[1:].split()[0]
-                sequence = []
-            elif line:
-                sequence.append("".join(line.split()))
-        finish(output_handle)
-
-
-def is_kunpeng_enodata_exit(log_path: Path) -> bool:
-    """Recognize the exact Kun-peng v0.7.12 zero-hit ENODATA failure."""
-
-    try:
-        content = log_path.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return False
-    has_no_data_message = "no data available" in content.lower()
-    has_enodata_identity = bool(
-        re.search(
-            r"(?:\benodata\b|\b(?:os error|code)\s*[:=]?\s*61\b)",
-            content,
-            flags=re.IGNORECASE,
-        )
-    )
-    return has_no_data_message and has_enodata_identity
-
-
-def run_kunpeng_taxonomy(
-    args: argparse.Namespace,
-    *,
-    source: Path,
-    selected_lengths: OrderedDict[str, int],
-    taxonomy_path: Path,
-    artifact_root: Path,
-    work: Path,
-    runtime_root: Path,
-    logs: Path,
-    environment: dict[str, str],
-) -> dict[str, object]:
-    """Classify one sample with Kun-peng and create TaxVAMB taxonomy."""
-
-    database_value = args.kunpeng_db or environment_value("KUNPENG_DB")
-    if not database_value:
-        raise UserError(
-            "taxvamb needs --taxonomy, --kunpeng-db, or "
-            "EUKBINMINER_KUNPENG_DB"
-        )
-    database = Path(database_value).expanduser().resolve()
-    database_state = kunpeng_database_state(database)
-    if not database_state["ok"]:
-        raise UserError(
-            "Kun-peng database is incomplete or invalid: "
-            f"{database}: {database_state['error']}"
-        )
-    kunpeng = Path(executable("kun_peng", "Kun-peng")).resolve()
-
-    chunk_dir = runtime_root / "kunpeng-chunks"
-    if chunk_dir.exists() and any(chunk_dir.iterdir()):
-        raise UserError(f"Kun-peng chunk directory is not empty: {chunk_dir}")
-    chunk_dir.mkdir(parents=True, exist_ok=True)
-    output_dir = artifact_root / "classifier-output"
-    if output_dir.exists() and any(output_dir.iterdir()):
-        raise UserError(f"partial Kun-peng output already exists: {output_dir}")
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    catalogue = work / "kunpeng.catalogue.fa"
-    samples = work / "kunpeng.samples.tsv"
-    converted = work / "kunpeng.converted"
-    write_classifier_catalogue(source, catalogue, selected_lengths)
-    atomic_text(
-        samples,
-        "rank\tstudy\tsample\tprefix\tcontigs\tbp\t"
-        "input_path\tabundance_path\n"
-        f"1\t{args.study}\t{args.sample}\tr000001C\t"
-        f"{len(selected_lengths)}\t{sum(selected_lengths.values())}\t"
-        f"{source}\t\n",
-    )
-
-    command = [
-        str(kunpeng),
-        "classify",
-        "--db",
-        str(database),
-        "--chunk-dir",
-        str(chunk_dir),
-        "--output-dir",
-        str(output_dir),
-        "-p",
-        str(args.threads),
-        "-g",
-        "3",
-        str(catalogue),
-    ]
-    taxonomy_log = logs / "taxonomy.kunpeng.log"
-    rc = run_logged(
-        command,
-        taxonomy_log,
-        environment=environment,
-    )
-    accepted_nonzero_enodata = rc != 0 and is_kunpeng_enodata_exit(
-        taxonomy_log
-    )
-    if rc != 0 and not accepted_nonzero_enodata:
-        raise UserError(
-            "Kun-peng taxonomy failed; see "
-            f"{taxonomy_log}"
-        )
-
-    classification_outputs = sorted(output_dir.glob("output_*.txt"))
-    reports = sorted(output_dir.glob("output_*.kreport2"))
-    if len(classification_outputs) != 1 or len(reports) != 1:
-        raise UserError(
-            "Kun-peng must produce exactly one sequence output and one "
-            f"kreport2 for a single input; observed outputs="
-            f"{[item.name for item in classification_outputs]}, reports="
-            f"{[item.name for item in reports]}"
-        )
-
-    from resolve_kunpeng_compat import resolve as resolve_kunpeng_compat
-
-    compatibility_output = work / "kunpeng.compat.output.txt"
-    compatibility_summary = resolve_kunpeng_compat(
-        classification_outputs[0],
-        catalogue,
-        database / "opts.k2d",
-        database / "taxo.k2d",
-        compatibility_output,
-        classification_report=reports[0],
-        minimum_hit_groups=3,
-    )
-    enodata_evidence_mode = "normal_exit"
-    if accepted_nonzero_enodata:
-        omitted = compatibility_summary["raw_omitted_zero_hit_contigs"]
-        raw_output = compatibility_summary["raw_output_contigs"]
-        expected = compatibility_summary["contigs"]
-        if omitted >= 1:
-            enodata_evidence_mode = "zero_hit_omission"
-        elif raw_output == expected:
-            # resolve_kunpeng_compat has already required one record per FASTA
-            # identifier and exact agreement between output, report and FASTA.
-            enodata_evidence_mode = "complete_output_report_consistent"
-        else:
-            compatibility_output.unlink(missing_ok=True)
-            raise UserError(
-                "Kun-peng reported ENODATA/OS error 61, but neither a "
-                "zero-hit omission nor a complete output/report identity "
-                "was proved"
-            )
-        note(
-            "accepted Kun-peng ENODATA/OS error 61 after strict "
-            f"output/report validation mode={enodata_evidence_mode}"
-        )
-
-    from classifier_to_taxvamb import convert as convert_classifier_output
-
-    convert_classifier_output(
-        compatibility_output,
-        reports[0],
-        samples,
-        converted,
-        classification_taxonomy=database / "taxo.k2d",
-    )
-    taxonomy_path.parent.mkdir(parents=True, exist_ok=True)
-    normalize_taxonomy(
-        converted / "per_sample" / "r000001.taxonomy.tsv",
-        taxonomy_path,
-        selected_lengths,
-    )
-
-    compressed_output = artifact_root / "kunpeng.output.txt.gz"
-    compressed_compatibility_output = (
-        artifact_root / "kunpeng.compat.output.txt.gz"
-    )
-    retained_report = artifact_root / "kunpeng.kreport2"
-    with classification_outputs[0].open("rb") as source_handle, gzip.open(
-        compressed_output,
-        "wb",
-        compresslevel=1,
-    ) as target_handle:
-        shutil.copyfileobj(source_handle, target_handle)
-    with compatibility_output.open("rb") as source_handle, gzip.open(
-        compressed_compatibility_output,
-        "wb",
-        compresslevel=1,
-    ) as target_handle:
-        shutil.copyfileobj(source_handle, target_handle)
-    shutil.copy2(reports[0], retained_report)
-    version_result = subprocess.run(
-        [str(kunpeng), "--version"],
-        check=False,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        env=environment,
-    )
-    provenance = {
-        "schema_version": 2,
-        "backend": "kunpeng",
-        "release_tag": KUNPENG_RELEASE_TAG,
-        "release_commit": KUNPENG_RELEASE_COMMIT,
-        "hpc_release_binary_sha256": KUNPENG_HPC_BINARY_SHA256,
-        "executable": str(kunpeng),
-        "executable_sha256": sha256_file(kunpeng),
-        "reported_version": version_result.stdout.strip(),
-        "database": str(database),
-        "database_state": database_state,
-        "minimum_hit_groups": 3,
-        "classifier_exit_code": rc,
-        "accepted_nonzero_enodata": accepted_nonzero_enodata,
-        "enodata_evidence_mode": enodata_evidence_mode,
-        "classifier_log_sha256": sha256_file(taxonomy_log),
-        "threads": args.threads,
-        "selected_contigs": len(selected_lengths),
-        "selected_bp": sum(selected_lengths.values()),
-        "taxonomy_sha256": sha256_file(taxonomy_path),
-        "classification_output_sha256": sha256_file(compressed_output),
-        "raw_classification_output_sha256": sha256_file(compressed_output),
-        "compatibility_classification_output_sha256": sha256_file(
-            compressed_compatibility_output
-        ),
-        "classification_report_sha256": sha256_file(retained_report),
-        "compatibility_resolution": {
-            key: value
-            for key, value in compatibility_summary.items()
-            if key
-            not in {
-                "classification_output",
-                "fasta",
-                "options",
-                "taxonomy",
-            }
-        },
-    }
-    atomic_text(
-        artifact_root / "provenance.json",
-        json.dumps(provenance, indent=2, sort_keys=True) + "\n",
-    )
-
-    shutil.rmtree(chunk_dir)
-    shutil.rmtree(output_dir)
-    shutil.rmtree(converted)
-    compatibility_output.unlink()
-    catalogue.unlink()
-    samples.unlink()
-    return provenance
 
 
 def complete_empty_input_workflow(
@@ -1866,11 +1249,6 @@ def complete_empty_input_workflow(
         "qc_tools": list(args.qc_list),
         "decision_qc": args.decision_qc,
         "random_seed": args.random_seed,
-        "taxonomy": "not_run_empty_input",
-        "taxonomy_provenance": {
-            "backend": "not_run_empty_input",
-            "reason": empty_input_reason,
-        },
         "qc_references": input_summary["qc_references"],
         "discovered_bins": 0,
         "qc_candidates": 0,
@@ -1963,18 +1341,6 @@ def run_locked_workflow(args: argparse.Namespace) -> None:
         runtime["depth_path"] = str(depth_inputs[0].path)
         runtime["depth_sha256"] = sha256_file(depth_inputs[0].path)
     runtime["threads"] = args.threads
-    runtime["taxonomy_input"] = None
-    if args.taxonomy is not None:
-        taxonomy_path, _ = resolve_taxonomy_input(
-            args.taxonomy, contigs=args.contigs.resolve(), sample=args.sample,
-            minimum_contig_bp=args.min_contig_bp,
-        )
-        runtime["taxonomy_input"] = {
-            "path": str(taxonomy_path.resolve()), "sha256": sha256_file(taxonomy_path),
-        }
-    runtime["kunpeng_db"] = str(Path(
-        args.kunpeng_db or environment_value("KUNPENG_DB")
-    ).expanduser().resolve()) if input_summary["taxonomy"] == "kunpeng" else None
     runtime["backend_environments"] = {
         name: environment_value(name)
         for name in ("CONDA_EXE", "REMAG_ENV", "CONCOCT_ENV", "METABAT2_ENV",
@@ -2120,39 +1486,14 @@ def run_locked_workflow(args: argparse.Namespace) -> None:
                 f"available branches: {completed_classic}"
             )
 
-    taxonomy_provenance: Optional[dict[str, object]] = None
-    vamb_family = tuple(
-        item for item in args.binner_list if item in {"vamb", "taxvamb"}
-    )
     try:
-        if vamb_family:
+        if "vamb" in args.binner_list:
             prepare_vamb_input(
                 preflight,
                 out / "inputs" / "r000001",
                 args.study,
                 args.sample,
             )
-            taxonomy_root = out / "taxonomy"
-            taxonomy_scope = "single"
-            taxonomy_path = (
-                taxonomy_root
-                / taxonomy_scope
-                / "per_sample"
-                / "r000001.taxonomy.tsv"
-            )
-            if "taxvamb" in vamb_family and args.taxonomy is not None:
-                taxonomy_source, _ = resolve_taxonomy_input(
-                    args.taxonomy,
-                    contigs=args.contigs.resolve(),
-                    sample=args.sample,
-                    minimum_contig_bp=args.min_contig_bp,
-                )
-                normalize_taxonomy(
-                    taxonomy_source,
-                    taxonomy_path,
-                    fasta_lengths(out / "inputs" / "r000001" / "input.fa"),
-                )
-
             vamb = executable("vamb", "VAMB")
             version_probe = subprocess.run(
                 [vamb, "--version"],
@@ -2172,43 +1513,17 @@ def run_locked_workflow(args: argparse.Namespace) -> None:
             env_values.update(
                 {
                     "INPUTS_ROOT": out / "inputs",
-                    "TAXONOMY_ROOT": taxonomy_root,
                     "OUT_ROOT": results_root,
-                    "ADDON_ROOT": out / "vamb_taxvamb",
+                    "ADDON_ROOT": out / "vamb",
                     "ADDON_STATUS_ROOT": out / "status",
                     "VAMB_EXE": vamb,
                     "VAMB_TOOL_IDENTITY": vamb_identity,
                     "VAMB_ENV_HISTORY": history,
                     "VAMB_MIN_CONTIG_INCLUSIVE": args.min_contig_bp,
                     "VAMB_MIN_FASTA_BP": args.retain_min_bin_bp,
-                    "VAMB_TAXVAMB_BINNERS": " ".join(vamb_family),
                 }
             )
             write_env(backend_env, env_values)
-
-            if "taxvamb" in vamb_family and args.taxonomy is None:
-                selected_lengths = fasta_lengths(
-                    out / "inputs" / "r000001" / "input.fa"
-                )
-                try:
-                    taxonomy_provenance = run_kunpeng_taxonomy(
-                        args,
-                        source=out / "inputs" / "r000001" / "input.fa",
-                        selected_lengths=selected_lengths,
-                        taxonomy_path=taxonomy_path,
-                        artifact_root=taxonomy_root / "kunpeng",
-                        work=work,
-                        runtime_root=runtime_root,
-                        logs=logs,
-                        environment=workflow_environment,
-                    )
-                except (UserError, OSError, ValueError) as error:
-                    if "vamb" not in vamb_family:
-                        raise
-                    note(f"TaxVAMB taxonomy failed: {error}; continuing with VAMB")
-                    vamb_family = ("vamb",)
-                    env_values["VAMB_TAXVAMB_BINNERS"] = "vamb"
-                    write_env(backend_env, env_values)
 
             process_env = dict(workflow_environment)
             process_env["SLURM_ARRAY_TASK_ID"] = "1"
@@ -2234,26 +1549,25 @@ def run_locked_workflow(args: argparse.Namespace) -> None:
             rc = run_logged(
                 [
                     "bash",
-                    str(SCRIPTS / "run_vamb_taxvamb_array.sh"),
+                    str(SCRIPTS / "run_vamb.sh"),
                     str(backend_env),
-                    taxonomy_scope,
                 ],
-                logs / "binning.vamb_taxvamb.log",
+                logs / "binning.vamb.log",
                 environment=process_env,
             )
             completed_vamb = successful_binners(
                 results_root,
                 args.study,
                 args.sample,
-                vamb_family,
+                ("vamb",),
             )
             if rc != 0:
                 note(
-                    "one or more VAMB-family binners failed; continuing with "
+                    "VAMB failed; continuing with "
                     f"available branches: {completed_vamb}"
                 )
     except (UserError, OSError, ValueError) as error:
-        note(f"VAMB-family branch failed: {error}; retaining successful binners")
+        note(f"VAMB branch failed: {error}; retaining successful binners")
 
     completed_binners = successful_binners(
         results_root,
@@ -2397,8 +1711,6 @@ def run_locked_workflow(args: argparse.Namespace) -> None:
         "qc_tools": list(args.qc_list),
         "decision_qc": args.decision_qc,
         "random_seed": args.random_seed,
-        "taxonomy": input_summary["taxonomy"],
-        "taxonomy_provenance": taxonomy_provenance,
         "qc_references": input_summary["qc_references"],
         "discovered_bins": json.loads(stats_done.read_text(encoding="utf-8"))[
             "discovered_bins"
@@ -2457,7 +1769,7 @@ def add_workflow_arguments(
         metavar="LIST",
         help=(
             "all or a comma-separated subset of "
-            "remag,concoct,metabat2,vamb,taxvamb (default: all)"
+            "remag,concoct,metabat2,vamb (default: all four)"
         ),
     )
     workflow.add_argument(
@@ -2476,26 +1788,6 @@ def add_workflow_arguments(
                 "also occur in --qc-tools (default: eukcc)"
             ),
         )
-
-    taxvamb = parser.add_argument_group("TaxVAMB")
-    taxonomy_source = taxvamb.add_mutually_exclusive_group()
-    taxonomy_source.add_argument(
-        "--taxonomy",
-        type=Path,
-        metavar="TSV_OR_DIR",
-        help=(
-            "contig taxonomy TSV, or a checksum-bearing reusable taxonomy "
-            "result directory"
-        ),
-    )
-    taxonomy_source.add_argument(
-        "--kunpeng-db",
-        metavar="DIR",
-        help=(
-            "sharded Kun-peng database; defaults to "
-            "EUKBINMINER_KUNPENG_DB when TaxVAMB needs classification"
-        ),
-    )
 
     references = parser.add_argument_group("reference databases")
     references.add_argument(

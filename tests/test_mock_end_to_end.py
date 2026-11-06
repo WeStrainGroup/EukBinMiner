@@ -3,14 +3,12 @@ from __future__ import annotations
 import csv
 import json
 import os
-import struct
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
 
-from mock_k2 import write_options, write_taxonomy
 
 
 PROJECT = Path(__file__).resolve().parents[1]
@@ -20,9 +18,7 @@ MOCK_TOOL = r"""#!/usr/bin/env python3
 import csv
 import json
 import os
-import struct
 import sys
-from collections import deque
 from pathlib import Path
 
 
@@ -58,59 +54,6 @@ def write_fasta(path, observed):
         "".join(f">{identifier}\n{sequence}\n" for identifier, sequence in observed),
         encoding="utf-8",
     )
-
-
-def reverse_complement_bits(value, length):
-    output = 0
-    for _ in range(length):
-        output = (output << 2) | (3 - (value & 3))
-        value >>= 2
-    return output
-
-
-def minimizer_event_count(sequence, options_path):
-    data = Path(options_path).read_bytes()
-    k, l, spaced, toggle = struct.unpack_from("<QQQQ", data)
-    mask = (1 << (2 * l)) - 1
-    toggle &= mask
-    capacity = k - l
-    window = deque()
-    count = value = valid = events = 0
-    for base in sequence.encode("ascii"):
-        code = {
-            ord("A"): 0,
-            ord("C"): 1,
-            ord("G"): 2,
-            ord("T"): 3,
-        }.get(base)
-        if code is None:
-            window.clear()
-            count = value = valid = 0
-            continue
-        value = ((value << 2) | code) & mask
-        valid += 1
-        if valid < l:
-            continue
-        canonical = min(value, reverse_complement_bits(value, l))
-        candidate = (canonical & spaced) ^ toggle
-        while window and window[-1][0] > candidate:
-            window.pop()
-        changed = (
-            (not window and count >= capacity)
-            or count == capacity
-        )
-        window.append((candidate, count))
-        while (
-            window
-            and count >= capacity
-            and window[0][1] < count - capacity
-        ):
-            window.popleft()
-            changed = True
-        count += 1
-        if count > capacity and changed:
-            events += 1
-    return events
 
 
 def binner_records(source, binner):
@@ -260,8 +203,6 @@ elif name == "eukcc":
         bin_path = args[-1]
         if "metabat2" in bin_path:
             completeness, contamination = "91", "1"
-        elif "taxvamb" in bin_path:
-            completeness, contamination = "92", "2"
         else:
             completeness, contamination = "95", "2"
         (out / "quality.csv").write_text(
@@ -300,59 +241,6 @@ elif name == "vamb":
         write_fasta(out / "bins" / f"{mode}-bin.fna", records(source))
         (out / "clusters.tsv").write_text("cluster\tcontig\n", encoding="utf-8")
         (out / "log.txt").write_text("mock VAMB complete\n", encoding="utf-8")
-elif name == "kun_peng":
-    if "--version" in args:
-        print("kun_peng 0.7.11")
-    else:
-        if "--seed" in args or "--random-seed" in args:
-            raise SystemExit("Kun-peng must not receive a random seed")
-        if os.environ.get("MOCK_KUNPENG_MODE") == "exit":
-            print("intentional Kun-peng failure", file=sys.stderr)
-            raise SystemExit(23)
-        chunk_dir = Path(value("--chunk-dir"))
-        output_dir = Path(value("--output-dir"))
-        chunk_dir.mkdir(parents=True, exist_ok=True)
-        output_dir.mkdir(parents=True, exist_ok=True)
-        if os.environ.get("MOCK_KUNPENG_MODE") == "missing":
-            raise SystemExit(0)
-        catalogue = Path(args[-1])
-        observed = records(catalogue)
-        report = output_dir / "output_1.kreport2"
-        mode = os.environ.get("MOCK_KUNPENG_MODE")
-        omitted = 1 if mode in {"zero_hit", "enodata", "truncated"} else 0
-        classified = len(observed) - (
-            1 if mode in {"zero_hit", "enodata"} else 0
-        )
-        report_rows = []
-        if mode in {"zero_hit", "enodata"}:
-            report_rows.append(
-                f"{100 / len(observed):.2f}\t1\t1\tU\t0\tunclassified\n"
-            )
-        report_rows.extend(
-            [
-                f"100.00\t{classified}\t0\tR\t1\troot\n",
-                f"100.00\t{classified}\t{classified}\tD\t2759\t"
-                "  Eukaryota\n",
-            ]
-        )
-        report.write_text("".join(report_rows), encoding="utf-8")
-        output_rows = [
-            f"C\t{identifier}\t2759\t{len(sequence)}\t"
-            f"2759:{minimizer_event_count(sequence, Path(value('--db')) / 'opts.k2d')}\n"
-            for identifier, sequence in observed
-        ]
-        if omitted:
-            output_rows.pop()
-        if os.environ.get("MOCK_KUNPENG_MODE") == "duplicate":
-            output_rows.append(output_rows[0])
-        output = output_dir / "output_1.txt"
-        output.write_text(
-            "".join(output_rows),
-            encoding="utf-8",
-        )
-        if mode in {"enodata", "enodata_complete"}:
-            print("Error: No data available (os error 61)", file=sys.stderr)
-            raise SystemExit(1)
 else:
     print(f"unsupported mock tool: {name}", file=sys.stderr)
     raise SystemExit(99)
@@ -377,7 +265,6 @@ class MockEndToEndTests(unittest.TestCase):
             "eukcc",
             "busco",
             "vamb",
-            "kun_peng",
         ):
             tool = self.tools / name
             tool.write_text(MOCK_TOOL, encoding="utf-8")
@@ -401,30 +288,12 @@ class MockEndToEndTests(unittest.TestCase):
             "contig_id\tdepth\nc1\t3\nc2\t2\nc3\t1\n",
             encoding="utf-8",
         )
-        self.taxonomy = self.root / "taxonomy.tsv"
-        self.taxonomy.write_text(
-            "contigs\tpredictions\n"
-            "c1\td__Eukaryota\n"
-            "c2\td__Eukaryota\n"
-            "c3\td__Eukaryota\n",
-            encoding="utf-8",
-        )
         self.eukcc_db = self.root / "eukcc_db"
         self.eukcc_db.mkdir()
         (self.eukcc_db / "db.info").write_text("mock\n", encoding="utf-8")
         self.busco_db = self.root / "fungi_odb12"
         (self.busco_db / "hmms").mkdir(parents=True)
         (self.busco_db / "dataset.cfg").write_text("name=fungi\n", encoding="utf-8")
-        self.kunpeng_db = self.root / "kunpeng"
-        self.kunpeng_db.mkdir()
-        write_options(self.kunpeng_db / "opts.k2d")
-        write_taxonomy(self.kunpeng_db / "taxo.k2d")
-        (self.kunpeng_db / "hash_config.k2d").write_bytes(
-            struct.pack("<6Q", 0, 1, 3, 3, 3, 16)
-        )
-        (self.kunpeng_db / "hash_1.k2d").write_bytes(
-            struct.pack("<2Q", 1, 3) + b"\0" * 12
-        )
         self.environment = dict(os.environ)
         self.environment["PATH"] = (
             str(self.tools) + os.pathsep + self.environment.get("PATH", "")
@@ -465,7 +334,6 @@ class MockEndToEndTests(unittest.TestCase):
         self,
         *arguments: str,
         mock_bin_mode: str | None = None,
-        mock_kunpeng_mode: str | None = None,
         expected_seed: int | None = None,
         expected_coverage_columns: tuple[str, ...] | None = None,
         concoct_success: bool = False,
@@ -473,8 +341,6 @@ class MockEndToEndTests(unittest.TestCase):
         environment = dict(self.environment)
         if mock_bin_mode is not None:
             environment["MOCK_BIN_MODE"] = mock_bin_mode
-        if mock_kunpeng_mode is not None:
-            environment["MOCK_KUNPENG_MODE"] = mock_kunpeng_mode
         if expected_seed is not None:
             environment["MOCK_EXPECTED_SEED"] = str(expected_seed)
         if expected_coverage_columns is not None:
@@ -525,24 +391,18 @@ class MockEndToEndTests(unittest.TestCase):
     def test_doctor_checks_current_environment_and_databases(self) -> None:
         completed = self.run_cli(
             "doctor",
+            "--binners",
+            "remag,concoct,metabat2,vamb",
             "--eukcc-db",
             str(self.eukcc_db),
             "--busco-db",
             str(self.busco_db),
-            "--kunpeng-db",
-            str(self.kunpeng_db),
         )
         self.assertEqual(completed.returncode, 0, completed.stderr)
         report = json.loads(completed.stdout)
         self.assertTrue(report["ok"])
         self.assertEqual(report["tool"], "EukBinMiner")
         self.assertEqual(report["execution_mode"], "current_environment_path")
-        self.assertGreater(
-            report["databases"]["kunpeng"]["shard_bytes"],
-            16,
-        )
-        self.assertEqual(report["databases"]["kunpeng"]["partitions"], 1)
-
     def test_configured_split_conda_environments_reach_backends(self) -> None:
         output = self.root / "split-conda-environments"
         configured = {
@@ -646,7 +506,7 @@ class MockEndToEndTests(unittest.TestCase):
         self.assertEqual(strict_summary["representatives"], 2)
         self.assertEqual(strict_summary["alternatives"], 0)
 
-    def test_repeated_mapping_depths_reach_all_five_binners(self) -> None:
+    def test_repeated_mapping_depths_reach_all_four_binners(self) -> None:
         alpha = self.root / "alpha.depth.tsv"
         beta = self.root / "beta.depth.tsv"
         alpha.write_text(
@@ -697,9 +557,7 @@ class MockEndToEndTests(unittest.TestCase):
             "--output",
             str(output),
             "--binners",
-            "remag,concoct,metabat2,vamb,taxvamb",
-            "--taxonomy",
-            str(self.taxonomy),
+            "remag,concoct,metabat2,vamb",
             "--qc-tools",
             "eukcc",
             "--decision-qc",
@@ -729,7 +587,7 @@ class MockEndToEndTests(unittest.TestCase):
         )
         self.assertEqual(
             summary["completed_binners"],
-            ["remag", "concoct", "metabat2", "vamb", "taxvamb"],
+            ["remag", "concoct", "metabat2", "vamb"],
             completed.stderr
             + (output / "logs" / "binning.classic.log").read_text(
                 encoding="utf-8"
@@ -824,7 +682,7 @@ class MockEndToEndTests(unittest.TestCase):
         summary = json.loads((output / "summary.json").read_text(encoding="utf-8"))
         self.assertEqual(summary["completed_binners"], ["concoct"])
 
-    def test_multi_column_matrix_reaches_all_five_binners(self) -> None:
+    def test_multi_column_matrix_reaches_all_four_binners(self) -> None:
         matrix = self.root / "mapped-samples.coverage.tsv"
         matrix.write_text(
             "contig_id\tdonor_A\tdonor_B\tdonor_C\n"
@@ -844,9 +702,7 @@ class MockEndToEndTests(unittest.TestCase):
             "--output",
             str(output),
             "--binners",
-            "remag,concoct,metabat2,vamb,taxvamb",
-            "--taxonomy",
-            str(self.taxonomy),
+            "remag,concoct,metabat2,vamb",
             "--qc-tools",
             "eukcc",
             "--decision-qc",
@@ -868,7 +724,7 @@ class MockEndToEndTests(unittest.TestCase):
         summary = json.loads((output / "summary.json").read_text(encoding="utf-8"))
         self.assertEqual(
             summary["completed_binners"],
-            ["remag", "concoct", "metabat2", "vamb", "taxvamb"],
+            ["remag", "concoct", "metabat2", "vamb"],
         )
         normalized = (
             output / "work" / "input" / "depth.jgi.tsv"
@@ -893,234 +749,8 @@ class MockEndToEndTests(unittest.TestCase):
             "contigname\tdonor_A\tdonor_B\tdonor_C",
         )
 
-    def test_taxvamb_with_user_taxonomy_and_kunpeng(self) -> None:
-        taxonomy_output = self.root / "taxvamb-user-taxonomy"
-        supplied = self.run_cli(
-            *self.base_run(taxonomy_output),
-            "--binners",
-            "vamb,taxvamb",
-            "--taxonomy",
-            str(self.taxonomy),
-            "--qc-tools",
-            "eukcc",
-            "--decision-qc",
-            "eukcc",
-            "--eukcc-db",
-            str(self.eukcc_db),
-        )
-        self.assertEqual(supplied.returncode, 0, supplied.stderr)
-        supplied_summary = json.loads(
-            (taxonomy_output / "summary.json").read_text(encoding="utf-8")
-        )
-        self.assertEqual(supplied_summary["completed_binners"], ["vamb", "taxvamb"])
-        self.assertEqual(supplied_summary["representatives"], 1)
 
-        kunpeng_output = self.root / "taxvamb-kunpeng"
-        classified = self.run_cli(
-            *self.base_run(kunpeng_output),
-            "--binners",
-            "taxvamb",
-            "--kunpeng-db",
-            str(self.kunpeng_db),
-            "--qc-tools",
-            "eukcc",
-            "--decision-qc",
-            "eukcc",
-            "--eukcc-db",
-            str(self.eukcc_db),
-        )
-        self.assertEqual(classified.returncode, 0, classified.stderr)
-        taxonomy_path = (
-            kunpeng_output
-            / "taxonomy"
-            / "single"
-            / "per_sample"
-            / "r000001.taxonomy.tsv"
-        )
-        self.assertTrue(taxonomy_path.is_file())
-        self.assertIn("c1", taxonomy_path.read_text(encoding="utf-8"))
-        summary = json.loads(
-            (kunpeng_output / "summary.json").read_text(encoding="utf-8")
-        )
-        self.assertEqual(summary["taxonomy"], "kunpeng")
-        self.assertEqual(
-            summary["taxonomy_provenance"]["backend"],
-            "kunpeng",
-        )
-        self.assertTrue(
-            (
-                kunpeng_output
-                / "taxonomy"
-                / "kunpeng"
-                / "kunpeng.output.txt.gz"
-            ).is_file()
-        )
 
-    def test_kunpeng_failures_are_explicit(self) -> None:
-        missing_db = self.root / "missing-kunpeng-db"
-        missing_db.mkdir()
-        invalid = self.run_cli(
-            "validate",
-            "--sample",
-            "sample1",
-            "--contigs",
-            str(self.fasta),
-            "--depth",
-            str(self.depth),
-            "--binners",
-            "taxvamb",
-            "--kunpeng-db",
-            str(missing_db),
-            "--qc-tools",
-            "eukcc",
-            "--decision-qc",
-            "eukcc",
-            "--eukcc-db",
-            str(self.eukcc_db),
-            "--min-contig-bp",
-            "1",
-        )
-        self.assertEqual(invalid.returncode, 2)
-        self.assertIn("Kun-peng database is incomplete", invalid.stderr)
-
-        for mode, expected in (
-            ("exit", "Kun-peng taxonomy failed"),
-            ("missing", "exactly one sequence output"),
-            ("duplicate", "duplicate classification"),
-            ("truncated", "classified counts differ"),
-        ):
-            output = self.root / f"kunpeng-{mode}"
-            completed = self.run_cli(
-                *self.base_run(output),
-                "--binners",
-                "taxvamb",
-                "--kunpeng-db",
-                str(self.kunpeng_db),
-                "--qc-tools",
-                "eukcc",
-                "--decision-qc",
-                "eukcc",
-                "--eukcc-db",
-                str(self.eukcc_db),
-                mock_kunpeng_mode=mode,
-            )
-            self.assertEqual(completed.returncode, 2)
-            self.assertIn(expected, completed.stderr)
-
-        zero_hit_output = self.root / "kunpeng-zero-hit"
-        completed = self.run_cli(
-            *self.base_run(zero_hit_output),
-            "--binners",
-            "taxvamb",
-            "--kunpeng-db",
-            str(self.kunpeng_db),
-            "--qc-tools",
-            "eukcc",
-            "--decision-qc",
-            "eukcc",
-            "--eukcc-db",
-            str(self.eukcc_db),
-            mock_kunpeng_mode="zero_hit",
-        )
-        self.assertEqual(completed.returncode, 0, completed.stderr)
-        provenance = json.loads(
-            (
-                zero_hit_output
-                / "taxonomy"
-                / "kunpeng"
-                / "provenance.json"
-            ).read_text(encoding="utf-8")
-        )
-        compatibility = provenance["compatibility_resolution"]
-        self.assertEqual(
-            compatibility["raw_omitted_zero_hit_contigs"],
-            1,
-        )
-        self.assertEqual(compatibility["contigs"], 3)
-        self.assertEqual(provenance["classifier_exit_code"], 0)
-        self.assertFalse(provenance["accepted_nonzero_enodata"])
-
-        enodata_output = self.root / "kunpeng-enodata"
-        completed = self.run_cli(
-            *self.base_run(enodata_output),
-            "--binners",
-            "taxvamb",
-            "--kunpeng-db",
-            str(self.kunpeng_db),
-            "--qc-tools",
-            "eukcc",
-            "--decision-qc",
-            "eukcc",
-            "--eukcc-db",
-            str(self.eukcc_db),
-            mock_kunpeng_mode="enodata",
-        )
-        self.assertEqual(completed.returncode, 0, completed.stderr)
-        provenance = json.loads(
-            (
-                enodata_output
-                / "taxonomy"
-                / "kunpeng"
-                / "provenance.json"
-            ).read_text(encoding="utf-8")
-        )
-        self.assertEqual(provenance["classifier_exit_code"], 1)
-        self.assertTrue(provenance["accepted_nonzero_enodata"])
-        self.assertEqual(
-            provenance["compatibility_resolution"][
-                "raw_omitted_zero_hit_contigs"
-            ],
-            1,
-        )
-
-    def test_kunpeng_rejects_dirty_chunk_directory_and_mutual_exclusion(
-        self,
-    ) -> None:
-        output = self.root / "kunpeng-dirty"
-        dirty = output / "work" / "runtime" / "kunpeng-chunks"
-        dirty.mkdir(parents=True)
-        (dirty / "stale.bin").write_text("stale\n", encoding="utf-8")
-        completed = self.run_cli(
-            *self.base_run(output),
-            "--binners",
-            "taxvamb",
-            "--kunpeng-db",
-            str(self.kunpeng_db),
-            "--qc-tools",
-            "eukcc",
-            "--decision-qc",
-            "eukcc",
-            "--eukcc-db",
-            str(self.eukcc_db),
-        )
-        self.assertEqual(completed.returncode, 2)
-        self.assertIn("output lacks matching run metadata", completed.stderr)
-
-        mutually_exclusive = self.run_cli(
-            "validate",
-            "--sample",
-            "sample1",
-            "--contigs",
-            str(self.fasta),
-            "--depth",
-            str(self.depth),
-            "--binners",
-            "taxvamb",
-            "--taxonomy",
-            str(self.taxonomy),
-            "--kunpeng-db",
-            str(self.kunpeng_db),
-            "--qc-tools",
-            "eukcc",
-            "--decision-qc",
-            "eukcc",
-            "--eukcc-db",
-            str(self.eukcc_db),
-            "--min-contig-bp",
-            "1",
-        )
-        self.assertEqual(mutually_exclusive.returncode, 2)
-        self.assertIn("not allowed with argument", mutually_exclusive.stderr)
 
     def test_zero_qc_candidates_is_a_successful_empty_result(self) -> None:
         output = self.root / "zero-candidates"
@@ -1172,8 +802,6 @@ class MockEndToEndTests(unittest.TestCase):
             "all",
             "--decision-qc",
             "eukcc",
-            "--kunpeng-db",
-            str(self.kunpeng_db),
             "--eukcc-db",
             str(self.eukcc_db),
             "--busco-db",
@@ -1190,7 +818,7 @@ class MockEndToEndTests(unittest.TestCase):
         )
         self.assertTrue(summary["empty_input"])
         self.assertEqual(summary["completed_binners"], [])
-        self.assertEqual(summary["taxonomy"], "not_run_empty_input")
+        self.assertNotIn("taxonomy", summary)
         self.assertEqual(summary["discovered_bins"], 0)
         self.assertEqual(summary["representatives"], 0)
         self.assertEqual(run_metadata["contigs"], 0)
@@ -1202,7 +830,7 @@ class MockEndToEndTests(unittest.TestCase):
             / "empty1"
             / "branch_status.tsv"
         ).read_text(encoding="utf-8").splitlines()
-        self.assertEqual(len(branch_rows), 6)
+        self.assertEqual(len(branch_rows), 5)
         self.assertTrue(
             all(
                 "not_run_empty_input" in row
@@ -1226,8 +854,6 @@ class MockEndToEndTests(unittest.TestCase):
             "all",
             "--decision-qc",
             "eukcc",
-            "--kunpeng-db",
-            str(self.kunpeng_db),
             "--eukcc-db",
             str(self.eukcc_db),
             "--busco-db",
@@ -1249,8 +875,6 @@ class MockEndToEndTests(unittest.TestCase):
             "all",
             "--decision-qc",
             "eukcc",
-            "--kunpeng-db",
-            str(self.kunpeng_db),
             "--eukcc-db",
             str(self.eukcc_db),
             "--busco-db",
@@ -1286,7 +910,7 @@ class MockEndToEndTests(unittest.TestCase):
             / "sample1"
             / "branch_status.tsv"
         ).read_text(encoding="utf-8").splitlines()
-        self.assertEqual(len(branch_rows), 6)
+        self.assertEqual(len(branch_rows), 5)
         self.assertTrue(
             all(
                 "not_run_empty_input" in row
@@ -1301,7 +925,7 @@ class MockEndToEndTests(unittest.TestCase):
         self.assertEqual(help_result.returncode, 0, help_result.stderr)
         self.assertIn("--min-contig-bp", help_result.stdout)
         self.assertIn("--max-contamination", help_result.stdout)
-        self.assertIn("--kunpeng-db", help_result.stdout)
+        self.assertNotIn("--kunpeng-db", help_result.stdout)
         self.assertIn("--random-seed INT", help_result.stdout)
         self.assertIn("usage: eukbinminer", help_result.stdout)
         self.assertIn("default: 6311", help_result.stdout)
@@ -1328,9 +952,7 @@ class MockEndToEndTests(unittest.TestCase):
         completed = self.run_cli(
             *self.base_run(output),
             "--binners",
-            "remag,metabat2,vamb,taxvamb",
-            "--kunpeng-db",
-            str(self.kunpeng_db),
+            "remag,metabat2,vamb",
             "--qc-tools",
             "eukcc",
             "--decision-qc",
@@ -1364,7 +986,7 @@ class MockEndToEndTests(unittest.TestCase):
             / "results"
             / "union"
         )
-        for binner in ("remag", "metabat2", "vamb", "taxvamb"):
+        for binner in ("remag", "metabat2", "vamb"):
             fingerprint = json.loads(
                 (branch_root / binner / "fingerprint.json").read_text(
                     encoding="utf-8"
@@ -1378,9 +1000,7 @@ class MockEndToEndTests(unittest.TestCase):
         conflicting_reuse = self.run_cli(
             *self.base_run(output),
             "--binners",
-            "remag,metabat2,vamb,taxvamb",
-            "--kunpeng-db",
-            str(self.kunpeng_db),
+            "remag,metabat2,vamb",
             "--qc-tools",
             "eukcc",
             "--decision-qc",

@@ -2,7 +2,7 @@ cff-version: 1.2.0
 message: "If you use EukBinMiner, please cite this software."
 title: "EukBinMiner"
 type: software
-version: 0.1.1
+version: 0.1.2
 date-released: 2026-11-06
 authors:
   - family-names: "Contributors"

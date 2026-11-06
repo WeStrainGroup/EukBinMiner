@@ -23,6 +23,33 @@ class ReviewRegressionTests(unittest.TestCase):
                 "--qc-tools", "eukcc", "--decision-qc", "eukcc",
                 "--eukcc-db", str(self.eukcc_db)]
 
+    def test_default_and_all_run_four_binners_without_taxonomy(self):
+        expected = ["remag", "concoct", "metabat2", "vamb"]
+        self.assertEqual(cli.parse_choices("all", cli.BINNERS, "binners"), tuple(expected))
+        for extra in ([], ["--binners", "all"]):
+            output = self.root / ("explicit-all" if extra else "default-four")
+            result = self.run_cli(*self.base_run(output), *extra,
+                "--qc-tools", "eukcc", "--decision-qc", "eukcc",
+                "--eukcc-db", str(self.eukcc_db), concoct_success=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            summary = json.loads((output / "summary.json").read_text())
+            self.assertEqual(summary["requested_binners"], expected)
+            self.assertEqual(summary["completed_binners"], expected)
+            self.assertFalse((output / "taxonomy").exists())
+        result = self.run_cli("doctor", "--qc-tools", "eukcc",
+                              "--eukcc-db", str(self.eukcc_db))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("kunpeng", json.loads(result.stdout)["databases"])
+
+    def test_removed_taxonomy_options_are_rejected(self):
+        for extra in (["--binners", "taxvamb"], ["--taxonomy", "unused.tsv"],
+                      ["--kunpeng-db", "unused"]):
+            result = self.run_cli(*self.arguments(self.root / "removed"), *extra)
+            self.assertEqual(result.returncode, 2, result.stderr)
+        result = self.run_cli("--help")
+        self.assertNotIn("--taxonomy", result.stdout)
+        self.assertNotIn("--kunpeng-db", result.stdout)
+
     def test_reuse_rejects_changes_and_corrupt_mags(self):
         output = self.root / "reuse"
         args = self.arguments(output)
@@ -88,26 +115,7 @@ class ReviewRegressionTests(unittest.TestCase):
             summary.write_text(text)
             self.assertIsNone(parse_summary(summary))
 
-    def test_kunpeng_complete_enodata_is_validated(self):
-        output = self.root / "complete-enodata"
-        args = self.arguments(output)
-        args[args.index("--binners") + 1] = "taxvamb"
-        result = self.run_cli(*args, "--kunpeng-db", str(self.kunpeng_db),
-                              mock_kunpeng_mode="enodata_complete")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        provenance = json.loads((output / "taxonomy/kunpeng/provenance.json").read_text())
-        self.assertEqual(provenance["enodata_evidence_mode"],
-                         "complete_output_report_consistent")
 
-    def test_taxonomy_failure_preserves_other_binners(self):
-        output = self.root / "taxonomy-failed"
-        args = self.arguments(output)
-        args[args.index("--binners") + 1] = "metabat2,vamb,taxvamb"
-        result = self.run_cli(*args, "--kunpeng-db", str(self.kunpeng_db),
-                              mock_kunpeng_mode="exit")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        summary = json.loads((output / "summary.json").read_text())
-        self.assertEqual(summary["completed_binners"], ["metabat2", "vamb"])
 
     def test_zero_coverage_column_is_logged_and_removed_for_vamb(self):
         self.depth.write_text("contig_id\talpha\tzero\nc1\t3\t0\nc2\t2\t0\nc3\t1\t0\n")
