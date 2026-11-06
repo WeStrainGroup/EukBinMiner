@@ -34,6 +34,8 @@ REPRESENTATIVE_COLUMNS = (
     "contigs",
     "n50",
     "bp",
+    "shared_contig_bp",
+    "shared_contig_fraction",
 )
 ALTERNATIVE_COLUMNS = (
     "sample_rank",
@@ -496,6 +498,13 @@ def select(
             }
         )
 
+    # Count only final retained bins, including overlaps within one binner.
+    contig_uses = Counter(key for candidate in selected for key in candidate.contig_bp)
+    for candidate, row in zip(selected, representative_rows):
+        shared_bp = sum(bp for key, bp in candidate.contig_bp.items() if contig_uses[key] > 1)
+        row["shared_contig_bp"] = shared_bp
+        row["shared_contig_fraction"] = f"{shared_bp / candidate.fasta_bp:.6f}"
+
     out_dir.mkdir(parents=True, exist_ok=True)
     representatives_path = out_dir / "representatives.tsv"
     alternatives_path = out_dir / "alternatives.tsv"
@@ -517,7 +526,7 @@ def select(
         summary_path,
         json.dumps(
             {
-                "schema_version": 2,
+                "schema_version": 3,
                 "method": "quality_ordered_cross_binner_overlap_suppression",
                 "sample_rank": expected_rank,
                 "study": expected_study,
@@ -540,6 +549,8 @@ def select(
                     "bin_id_asc",
                 ],
                 "same_binner_comparisons": "skipped",
+                "shared_contig_fraction_definition": "bp_shared_with_any_other_final_bin/bin_bp",
+                "shared_contig_fraction_scope": "all_final_bins_in_this_assembly_including_same_binner",
                 "samples": 1,
                 "eligible_candidates": len(candidates),
                 "representatives": len(representative_rows),

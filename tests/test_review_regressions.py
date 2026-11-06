@@ -239,8 +239,44 @@ class ReviewRegressionTests(unittest.TestCase):
             output = self.root / label
             select(table, metadata, output, 0.5, 5, 50, 10)
             with (output / "representatives.tsv").open() as handle:
-                selected = [row["representative_bin_id"] for row in csv.DictReader(handle, delimiter="\t")]
-            self.assertEqual(selected, expected)
+                selected_rows = list(csv.DictReader(handle, delimiter="\t"))
+            self.assertEqual([row["representative_bin_id"] for row in selected_rows], expected)
+            expected_fraction = "0.000000" if label == "chain" else "0.500000"
+            self.assertEqual([row["shared_contig_fraction"] for row in selected_rows],
+                             [expected_fraction, expected_fraction])
+
+    def test_shared_fraction_uses_union_of_final_bins_and_contig_identity(self):
+        from select_within_sample_representatives import select
+        metadata = self.root / "sample.json"
+        metadata.write_text(json.dumps({"rank": 1, "study": "study", "sample": "sample"}))
+        rows = []
+        # D is suppressed by A; its c3 must not inflate A's shared fraction.
+        # C shares reverse-complement c1, but its changed c2 is not shared.
+        for name, binner, completeness, contigs in (
+            ("a", "remag", 99, [("c1", "A" * 10), ("c2", "A" * 20), ("c3", "A" * 70)]),
+            ("b", "metabat2", 98, [("c1", "A" * 10), ("c2", "A" * 20), ("b", "A" * 70)]),
+            ("c", "concoct", 97, [("c1", "T" * 10), ("c2", "C" * 20), ("c4", "A" * 70)]),
+            ("d", "vamb", 96, [("c3", "A" * 70), ("c5", "A" * 30)]),
+        ):
+            fasta = self.root / f"{name}.fa"
+            fasta.write_text("".join(f">{key}\n{seq}\n" for key, seq in contigs))
+            rows.append({"bin_id": name, "sample_rank": 1, "study": "study", "sample": "sample",
+                         "binner": binner, "bin_path": str(fasta), "decision_qc": "eukcc",
+                         "contamination_source": "eukcc_contamination", "qc_pass": "yes",
+                         "completeness": completeness, "contamination": 0,
+                         "contigs": len(contigs), "n50": 70, "bp": 100})
+        qc = self.root / "qc.tsv"
+        with qc.open("w") as handle:
+            writer = csv.DictWriter(handle, fieldnames=list(rows[0]), delimiter="\t")
+            writer.writeheader()
+            writer.writerows(rows)
+        output = self.root / "shared"
+        select(qc, metadata, output, 0.5, 5, 50, 10)
+        with (output / "representatives.tsv").open() as handle:
+            observed = [(row["representative_bin_id"], row["shared_contig_bp"], row["shared_contig_fraction"])
+                        for row in csv.DictReader(handle, delimiter="\t")]
+        self.assertEqual(observed, [("a", "30", "0.300000"), ("b", "30", "0.300000"),
+                                    ("c", "10", "0.100000")])
 
     def test_failed_current_status_excludes_existing_branch(self):
         results = self.root / "results"

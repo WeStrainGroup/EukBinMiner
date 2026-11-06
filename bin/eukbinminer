@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import IO, Iterable, Optional, Sequence
 
 
-VERSION = "0.1.2"
+VERSION = "0.1.3"
 TOOL_NAME = "EukBinMiner"
 CLI_NAME = "eukbinminer"
 BINNERS = ("remag", "concoct", "metabat2", "vamb")

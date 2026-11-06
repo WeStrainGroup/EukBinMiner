@@ -220,7 +220,13 @@ recorded in validation and run metadata.
 
 - `mags/`: copied non-redundant representative-bin FASTA files and
   `manifest.tsv` (the path is retained for output-schema compatibility)
-- `selection/representatives.tsv`: selected representatives and their metrics
+- `selection/representatives.tsv`: selected representatives and their metrics,
+  including `shared_contig_bp` and `shared_contig_fraction` (0 to 1). These count
+  original contigs also present in any other final retained bin from the same
+  assembly, including the same binner. Each shared contig is counted once by
+  length; discarded alternatives do not contribute. Identity uses original ID
+  plus normalized sequence, not sequence similarity. This diagnostic does not
+  change selection, QC scores or bin contents; it is not a contamination estimate.
 - `selection/alternatives.tsv`: suppressed cross-binner alternatives
 - `qc/`: seqkit, EukCC, BUSCO, and decision tables
 - `results/`: retained successful raw binner branches
@@ -250,6 +256,9 @@ Historical real-data runs use frozen versions. The changes in this source
 release are validated by software regression tests.
 
 ## Review changes
+
+- Version 0.1.3: report final-bin shared contig length and fraction without
+  changing selection or recovering additional bins.
 
 - Version 0.1.2: default and `all` select only ReMAG, CONCOCT, MetaBAT2 and VAMB.
   TaxVAMB, taxonomy options and classifier dependencies have been removed.
